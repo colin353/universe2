@@ -1,0 +1,15 @@
+[[rust_library]]
+name = "flags"
+edition = "2018"
+srcs = [
+  "lib.rs",
+  "parse.rs",
+]
+
+[[rust_test]]
+name = "flags_test"
+edition = "2018"
+srcs = [
+  "lib.rs",
+  "parse.rs",
+]

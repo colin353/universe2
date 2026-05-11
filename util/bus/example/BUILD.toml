@@ -1,0 +1,58 @@
+[[rust_bus_library]]
+name = "schema"
+edition = "2021"
+srcs = ["schema.bus"]
+
+[[rust_bus_library]]
+name = "fortune_bus"
+edition = "2021"
+srcs = ["fortune.bus"]
+
+[[rust_binary]]
+name = "example"
+edition = "2021"
+srcs = ["example.rs"]
+deps = [
+  ":schema",
+  "//util/bus:bus",
+  "//util/flags:flags",
+]
+
+[[rust_binary]]
+name = "fortune_server"
+edition = "2021"
+srcs = ["fortune_server.rs"]
+deps = [
+  ":fortune_bus",
+  "//util/bus:bus",
+  "//util/bus:bus_rpc",
+]
+cargo_deps = [
+  { package = "tokio", version = "=1.48.0", default_features = false, features = ["macros", "rt-multi-thread", "time"] },
+]
+
+[[rust_binary]]
+name = "fortune_client"
+edition = "2021"
+srcs = ["fortune_client.rs"]
+deps = [
+  ":fortune_bus",
+  "//util/bus:bus",
+  "//util/bus:bus_rpc",
+  "//util/flags:flags",
+]
+cargo_deps = [
+  { package = "futures", version = "=0.3.31", default_features = false, features = ["std"] },
+  { package = "tokio", version = "=1.48.0", default_features = false, features = ["macros", "rt-multi-thread"] },
+]
+
+[[rust_binary]]
+name = "fortune_async_client"
+edition = "2021"
+srcs = ["fortune_async_client.rs"]
+deps = [
+  ":fortune_bus",
+  "//util/bus:bus",
+  "//util/bus:bus_rpc",
+  "//util/flags:flags",
+]

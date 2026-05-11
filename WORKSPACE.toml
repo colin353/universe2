@@ -1,0 +1,17 @@
+[workspace]
+cache_dir = ".cbs/cache"
+
+[toolchain.rust]
+rustc = "rustc"
+
+[[plugins]]
+name = "bus"
+path = "/tmp/bus.cdylib"
+
+[target]
+family = "unix"
+os = "macos"
+env = ""
+arch = "aarch64"
+vendor = "apple"
+endian = "little"

@@ -1,0 +1,9 @@
+message Data {
+    id: u32 = 1
+    name: string = 2
+    payload: bytes = 3
+}
+
+message ListOfItems {
+    items: repeated u32 = 0
+}

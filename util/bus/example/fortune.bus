@@ -1,0 +1,12 @@
+message FortuneRequest {
+    fortune_id: u32 = 0
+}
+
+message FortuneResponse {
+    fortune: string = 0
+}
+
+service Fortune {
+    rpc fortune(FortuneRequest) -> FortuneResponse
+    rpc fortune_stream(FortuneRequest) -> stream FortuneResponse
+}

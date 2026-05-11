@@ -1,0 +1,23 @@
+[[rust_bus_library]]
+name = "battery"
+edition = "2021"
+srcs = ["battery.bus"]
+
+[[rust_library]]
+name = "encoding"
+edition = "2021"
+srcs = ["encoding.rs"]
+deps = [
+  ":battery",
+  "//util/bus:bus",
+]
+
+[[rust_test]]
+name = "encoding_test"
+edition = "2021"
+root_source = "encoding.rs"
+srcs = ["encoding.rs"]
+deps = [
+  ":battery",
+  "//util/bus:bus",
+]

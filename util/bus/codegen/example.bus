@@ -1,0 +1,51 @@
+message Zoot {
+  toot: Toot = 0
+  size: repeated u64 = 1
+  name: string = 2
+}
+
+enum State {
+  Disabled = 0
+  Partial = 1
+  Maximum = 2
+}
+
+message Toot {
+  id: u32 = 0;
+  data: bytes = 1;
+}
+
+message Container {
+  values: repeated Toot = 0;
+  names: repeated string = 1;
+}
+
+message Blort {
+  payloads: repeated bytes = 0;
+}
+
+message Multiplicand {
+  // reserved: 1-3
+  divisor: u32 = 3;
+  // reserved: 4
+  quotient: u32 = 5;
+}
+
+message Summand {
+  left: u32 = 0;
+  right: u32 = 1;
+  middle: u32 = 2;
+  divisor: u32 = 3;
+  subtractand: u32 = 4;
+  quotient: u32 = 5;
+  product: u32 = 6;
+}
+
+message Request {
+  desired: State = 0;
+  actual: State = 1;
+}
+
+message History {
+  sequence: repeated State = 0;
+}

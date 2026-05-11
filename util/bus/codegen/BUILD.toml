@@ -1,0 +1,36 @@
+[[rust_binary]]
+name = "codegen"
+edition = "2021"
+srcs = [
+  "codegen.rs",
+  "rust.rs",
+]
+deps = [
+  "//util/bus:parser",
+  "//util/flags:flags",
+]
+
+[[rust_library]]
+name = "test"
+edition = "2021"
+srcs = [
+  "test.rs",
+  "test_test.rs",
+]
+deps = ["//util/bus:bus"]
+cargo_deps = [
+  { package = "futures", version = "=0.3.31", default_features = false, features = ["std"] },
+]
+
+[[rust_test]]
+name = "codegen_test"
+edition = "2021"
+root_source = "test.rs"
+srcs = [
+  "test.rs",
+  "test_test.rs",
+]
+deps = ["//util/bus:bus"]
+cargo_deps = [
+  { package = "futures", version = "=0.3.31", default_features = false, features = ["std"] },
+]
