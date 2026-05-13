@@ -1,0 +1,7 @@
+import { rust_bus_library } from "//util/cbs:build_defs.ccl"
+
+metal_bus = rust_bus_library {
+    edition = "2021"
+    srcs = ["metal.bus"]
+}
+

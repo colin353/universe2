@@ -1,0 +1,49 @@
+import { rust_binary, rust_library, rust_test } from "//util/cbs:build_defs.ccl"
+
+codegen = rust_binary {
+    edition = "2021"
+    srcs = [
+        "codegen.rs",
+        "rust.rs",
+    ]
+    deps = [
+        "//util/bus:parser",
+        "//util/flags:flags",
+    ]
+}
+
+test = rust_library {
+    edition = "2021"
+    srcs = [
+        "test.rs",
+        "test_test.rs",
+    ]
+    deps = ["//util/bus:bus"]
+    cargo_deps = [
+        {
+            package = "futures"
+            version = "=0.3.31"
+            default_features = false
+            features = ["std"]
+        },
+    ]
+}
+
+codegen_test = rust_test {
+    edition = "2021"
+    root_source = "test.rs"
+    srcs = [
+        "test.rs",
+        "test_test.rs",
+    ]
+    deps = ["//util/bus:bus"]
+    cargo_deps = [
+        {
+            package = "futures"
+            version = "=0.3.31"
+            default_features = false
+            features = ["std"]
+        },
+    ]
+}
+

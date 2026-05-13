@@ -98,6 +98,20 @@ fn test_arrays() {
             Value::Number(125.0),
         ])
     );
+
+    assert_eq!(
+        exec_or_panic(
+            r#"[
+{
+    name = "cbs"
+}
+]"#,
+            ""
+        ),
+        Value::Array(vec![Value::Dictionary(crate::Dictionary {
+            kv_pairs: vec![(String::from("name"), Value::String(String::from("cbs")))]
+        })])
+    );
 }
 
 #[test]

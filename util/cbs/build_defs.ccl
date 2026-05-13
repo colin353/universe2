@@ -1,0 +1,31 @@
+rust_library = {
+    _type = "rust_library"
+    edition = "2018"
+    srcs = []
+    deps = []
+    cargo_deps = []
+}
+
+rust_binary = {
+    _type = "rust_binary"
+    edition = "2021"
+    srcs = []
+    deps = []
+    cargo_deps = []
+}
+
+rust_test = {
+    _type = "rust_test"
+    edition = "2021"
+    srcs = []
+    deps = []
+    cargo_deps = []
+}
+
+rust_bus_library = {
+    _type = "rust_bus_library"
+    edition = "2021"
+    srcs = []
+    deps = []
+}
+

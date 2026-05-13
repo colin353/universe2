@@ -1,0 +1,24 @@
+import { rust_library, rust_test } from "//util/cbs:build_defs.ccl"
+
+cbs_plugin_sdk = rust_library {
+    edition = "2021"
+    srcs = ["lib.rs"]
+    cargo_deps = [
+        {
+            package = "flatbuffers"
+            version = "=25.12.19"
+        },
+    ]
+}
+
+cbs_plugin_sdk_test = rust_test {
+    edition = "2021"
+    srcs = ["lib.rs"]
+    cargo_deps = [
+        {
+            package = "flatbuffers"
+            version = "=25.12.19"
+        },
+    ]
+}
+

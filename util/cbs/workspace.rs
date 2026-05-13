@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use crate::config_file::{load_build_table, load_workspace_table, ConfigTable, ConfigValue};
 use crate::core::{
     BuildConfigKey, BuildResult, Config, Context, ExternalRequirement, FakeResolver,
     FilesystemBuilder, ResolverPlugin, RuleContext, RulePlugin,
@@ -230,13 +231,10 @@ impl Workspace {
     ) -> std::io::Result<Option<String>> {
         let package_dir = self.root.join(&label.package);
         validate_workspace_relative(&self.root, &package_dir)?;
-        let build_file = package_dir.join("BUILD.toml");
-        if !build_file.exists() {
+        let Some(build_file) = build_file(&package_dir) else {
             return Ok(None);
-        }
-        let table = std::fs::read_to_string(&build_file)?
-            .parse::<toml::Table>()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        };
+        let table = load_build_table(&self.root, &build_file)?;
         for kind in rule_kinds {
             if find_named_target(&table, kind, &label.name)?.is_some() {
                 return Ok(Some(kind.clone()));
@@ -421,10 +419,13 @@ impl ResolverPlugin for WorkspaceResolver {
         let label = parse_label(target, &self.current_package)?;
         let package_dir = self.root.join(&label.package);
         validate_workspace_relative(&self.root, &package_dir)?;
-        let build_file = package_dir.join("BUILD.toml");
-        let table = std::fs::read_to_string(&build_file)?
-            .parse::<toml::Table>()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let build_file = build_file(&package_dir).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no BUILD.ccl found in {}", package_dir.display()),
+            )
+        })?;
+        let table = load_build_table(&self.root, &build_file)?;
 
         let rule_context = RuleContext {
             workspace_root: self.root.clone(),
@@ -487,7 +488,7 @@ pub fn build_tests_from_current_workspace(
 }
 
 impl RuleContext {
-    pub fn source_paths(&self, target: &toml::Table, key: &str) -> std::io::Result<Vec<String>> {
+    pub fn source_paths(&self, target: &ConfigTable, key: &str) -> std::io::Result<Vec<String>> {
         string_list(target, key)?
             .into_iter()
             .map(|src| package_path(&self.workspace_root, &self.package_dir, &src))
@@ -499,7 +500,7 @@ impl RuleContext {
 
     pub fn optional_source_path(
         &self,
-        target: &toml::Table,
+        target: &ConfigTable,
         key: &str,
     ) -> std::io::Result<Option<String>> {
         target
@@ -512,7 +513,7 @@ impl RuleContext {
             .transpose()
     }
 
-    pub fn label_list(&self, target: &toml::Table, key: &str) -> std::io::Result<Vec<String>> {
+    pub fn label_list(&self, target: &ConfigTable, key: &str) -> std::io::Result<Vec<String>> {
         string_list(target, key)?
             .into_iter()
             .map(|dep| parse_label(&dep, &self.package).map(|label| canonical_label(&label)))
@@ -521,7 +522,7 @@ impl RuleContext {
 
     pub fn optional_label(
         &self,
-        target: &toml::Table,
+        target: &ConfigTable,
         key: &str,
     ) -> std::io::Result<Option<String>> {
         target
@@ -533,18 +534,18 @@ impl RuleContext {
 
     pub fn cargo_requirements(
         &self,
-        target: &toml::Table,
+        target: &ConfigTable,
     ) -> std::io::Result<Vec<ExternalRequirement>> {
         cargo_requirements(target, &self.package)
     }
 
-    pub fn required_string(&self, target: &toml::Table, key: &str) -> std::io::Result<String> {
+    pub fn required_string(&self, target: &ConfigTable, key: &str) -> std::io::Result<String> {
         required_string(target, key)
     }
 }
 
 fn cargo_requirements(
-    target: &toml::Table,
+    target: &ConfigTable,
     package: &str,
 ) -> std::io::Result<Vec<ExternalRequirement>> {
     let Some(value) = target.get("cargo_deps") else {
@@ -588,10 +589,10 @@ fn cargo_requirements(
 }
 
 fn find_named_target<'a>(
-    table: &'a toml::Table,
+    table: &'a ConfigTable,
     section: &str,
     name: &str,
-) -> std::io::Result<Option<&'a toml::Table>> {
+) -> std::io::Result<Option<&'a ConfigTable>> {
     let Some(value) = table.get(section) else {
         return Ok(None);
     };
@@ -621,8 +622,7 @@ fn collect_package_targets(
     rule_kinds: &[String],
     labels: &mut Vec<String>,
 ) -> std::io::Result<()> {
-    let build_file = dir.join("BUILD.toml");
-    if build_file.exists() {
+    if let Some(build_file) = build_file(dir) {
         let package = dir
             .strip_prefix(root)
             .map_err(|_| {
@@ -638,9 +638,7 @@ fn collect_package_targets(
             .to_string_lossy()
             .trim_matches('/')
             .to_string();
-        let table = std::fs::read_to_string(&build_file)?
-            .parse::<toml::Table>()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let table = load_build_table(root, &build_file)?;
         for kind in rule_kinds {
             for target in target_tables(&table, kind)? {
                 let name = required_string(target, "name")?;
@@ -672,9 +670,9 @@ fn is_hidden_path(path: &Path) -> bool {
 }
 
 fn target_tables<'a>(
-    table: &'a toml::Table,
+    table: &'a ConfigTable,
     section: &str,
-) -> std::io::Result<Vec<&'a toml::Table>> {
+) -> std::io::Result<Vec<&'a ConfigTable>> {
     let Some(value) = table.get(section) else {
         return Ok(Vec::new());
     };
@@ -698,9 +696,7 @@ fn target_tables<'a>(
 }
 
 fn load_workspace_config(root: &Path, workspace_file: &Path) -> std::io::Result<WorkspaceConfig> {
-    let table = std::fs::read_to_string(workspace_file)?
-        .parse::<toml::Table>()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let table = load_workspace_table(root, workspace_file)?;
     let rustc = table
         .get("toolchain")
         .and_then(|value| value.as_table())
@@ -728,7 +724,7 @@ fn load_workspace_config(root: &Path, workspace_file: &Path) -> std::io::Result<
 
 fn workspace_plugins(
     root: &Path,
-    table: &toml::Table,
+    table: &ConfigTable,
 ) -> std::io::Result<Vec<WorkspacePluginConfig>> {
     let Some(value) = table.get("plugins") else {
         return Ok(Vec::new());
@@ -756,7 +752,7 @@ fn workspace_plugins(
         .collect()
 }
 
-fn target_config(table: &toml::Table) -> Vec<(BuildConfigKey, String)> {
+fn target_config(table: &ConfigTable) -> Vec<(BuildConfigKey, String)> {
     let target = table.get("target").and_then(|value| value.as_table());
     let os = target
         .and_then(|target| target.get("os"))
@@ -892,7 +888,7 @@ fn validate_workspace_relative(root: &Path, path: &Path) -> std::io::Result<()> 
     Ok(())
 }
 
-fn string_list(table: &toml::Table, key: &str) -> std::io::Result<Vec<String>> {
+fn string_list(table: &ConfigTable, key: &str) -> std::io::Result<Vec<String>> {
     let Some(value) = table.get(key) else {
         return Ok(Vec::new());
     };
@@ -918,7 +914,7 @@ fn string_list(table: &toml::Table, key: &str) -> std::io::Result<Vec<String>> {
         .collect()
 }
 
-fn required_string(table: &toml::Table, key: &str) -> std::io::Result<String> {
+fn required_string(table: &ConfigTable, key: &str) -> std::io::Result<String> {
     table
         .get(key)
         .and_then(|value| value.as_str())
@@ -940,17 +936,20 @@ fn find_workspace_root(cwd: &Path) -> std::io::Result<PathBuf> {
         if !dir.pop() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "no WORKSPACE.toml found in current directory or any parent",
+                "no WORKSPACE.ccl found in current directory or any parent",
             ));
         }
     }
 }
 
 fn workspace_file(root: &Path) -> Option<PathBuf> {
-    ["WORKSPACE.toml", "WORKSPACE"]
-        .into_iter()
-        .map(|name| root.join(name))
-        .find(|path| path.exists())
+    let path = root.join("WORKSPACE.ccl");
+    path.exists().then_some(path)
+}
+
+fn build_file(package_dir: &Path) -> Option<PathBuf> {
+    let path = package_dir.join("BUILD.ccl");
+    path.exists().then_some(path)
 }
 
 fn package_for_cwd(root: &Path, cwd: &Path) -> std::io::Result<String> {
@@ -965,8 +964,7 @@ fn package_for_cwd(root: &Path, cwd: &Path) -> std::io::Result<String> {
         )
     })?;
     loop {
-        if root.join(package_dir).join("BUILD.toml").exists() || package_dir.as_os_str().is_empty()
-        {
+        if build_file(&root.join(package_dir)).is_some() || package_dir.as_os_str().is_empty() {
             return Ok(package_dir.to_string_lossy().trim_matches('/').to_string());
         }
         package_dir = package_dir.parent().unwrap_or_else(|| Path::new(""));
@@ -1101,7 +1099,7 @@ mod tests {
         let mut roots: Vec<_> = std::fs::read_dir(test_workspaces)
             .unwrap()
             .map(|entry| entry.unwrap().path())
-            .filter(|path| path.join("WORKSPACE.toml").exists())
+            .filter(|path| workspace_file(path).is_some())
             .collect();
         roots.sort();
         roots
@@ -1115,12 +1113,8 @@ mod tests {
     }
 
     fn collect_workspace_labels(root: &Path, dir: &Path, labels: &mut Vec<String>) {
-        let build_file = dir.join("BUILD.toml");
-        if build_file.exists() {
-            let table = std::fs::read_to_string(&build_file)
-                .unwrap()
-                .parse::<toml::Table>()
-                .unwrap();
+        if let Some(build_file) = build_file(dir) {
+            let table = load_build_table(root, &build_file).unwrap();
             let package = dir
                 .strip_prefix(root)
                 .unwrap()
@@ -1128,16 +1122,10 @@ mod tests {
                 .trim_matches('/')
                 .to_string();
             for section in ["rust_binary", "rust_library"] {
-                for target in table
-                    .get(section)
-                    .and_then(|value| value.as_array())
-                    .into_iter()
-                    .flatten()
-                {
+                for target in target_tables(&table, section).unwrap() {
                     let name = target
-                        .as_table()
-                        .and_then(|target| target.get("name"))
-                        .and_then(|name| name.as_str())
+                        .get("name")
+                        .and_then(ConfigValue::as_str)
                         .expect("test workspace targets must have names");
                     labels.push(canonical_label(&Label {
                         package: package.clone(),
@@ -1166,24 +1154,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("app")).unwrap();
         std::fs::write(
-            root.join("WORKSPACE.toml"),
-            "[workspace]\ncache_dir = \".cbs/cache\"\n",
+            root.join("WORKSPACE.ccl"),
+            "workspace = {\n    cache_dir = \".cbs/cache\"\n}\n",
         )
         .unwrap();
         std::fs::write(
-            root.join("app").join("BUILD.toml"),
+            root.join("app").join("BUILD.ccl"),
             r#"
-[[rust_library]]
-name = "lib"
-srcs = ["lib.rs"]
+lib = {
+    _type = "rust_library"
+    srcs = ["lib.rs"]
+}
 
-[[rust_binary]]
-name = "app"
-srcs = ["main.rs"]
+app = {
+    _type = "rust_binary"
+    srcs = ["main.rs"]
+}
 
-[[rust_test]]
-name = "unit"
-srcs = ["lib.rs"]
+unit = {
+    _type = "rust_test"
+    srcs = ["lib.rs"]
+}
 "#,
         )
         .unwrap();

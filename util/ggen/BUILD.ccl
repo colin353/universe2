@@ -1,0 +1,20 @@
+import { rust_library, rust_test } from "//util/cbs:build_defs.ccl"
+
+ggen = rust_library {
+    edition = "2018"
+    srcs = [
+        "lib.rs",
+        "basic.rs",
+        "macros.rs",
+    ]
+}
+
+ggen_test = rust_test {
+    edition = "2018"
+    srcs = [
+        "lib.rs",
+        "basic.rs",
+        "macros.rs",
+    ]
+}
+

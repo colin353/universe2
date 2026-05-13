@@ -1,4 +1,0 @@
-[[rust_bus_library]]
-name = "metal_bus"
-edition = "2021"
-srcs = ["metal.bus"]

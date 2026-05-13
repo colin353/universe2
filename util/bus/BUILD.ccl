@@ -1,0 +1,177 @@
+import { rust_binary, rust_library, rust_test } from "//util/cbs:build_defs.ccl"
+
+bus = rust_library {
+    edition = "2021"
+    srcs = [
+        "lib.rs",
+        "serializable.rs",
+        "varint.rs",
+        "pack.rs",
+        "repeated_field.rs",
+        "encoded_struct.rs",
+    ]
+    cargo_deps = [
+        {
+            package = "futures"
+            version = "=0.3.31"
+            default_features = false
+            features = ["std"]
+        },
+        {
+            package = "tokio"
+            version = "=1.48.0"
+            default_features = false
+            features = ["sync"]
+        },
+    ]
+}
+
+bus_test = rust_test {
+    edition = "2021"
+    srcs = [
+        "lib.rs",
+        "serializable.rs",
+        "varint.rs",
+        "pack.rs",
+        "repeated_field.rs",
+        "encoded_struct.rs",
+    ]
+    cargo_deps = [
+        {
+            package = "futures"
+            version = "=0.3.31"
+            default_features = false
+            features = ["std"]
+        },
+        {
+            package = "tokio"
+            version = "=1.48.0"
+            default_features = false
+            features = ["sync"]
+        },
+    ]
+}
+
+parser = rust_library {
+    edition = "2021"
+    srcs = [
+        "parser.rs",
+        "ast.rs",
+    ]
+    deps = ["//util/ggen:ggen"]
+}
+
+parser_test = rust_test {
+    edition = "2021"
+    root_source = "parser.rs"
+    srcs = [
+        "parser.rs",
+        "ast.rs",
+    ]
+    deps = ["//util/ggen:ggen"]
+}
+
+ast_test = rust_test {
+    edition = "2021"
+    root_source = "ast.rs"
+    srcs = ["ast.rs"]
+    deps = ["//util/ggen:ggen"]
+}
+
+fmt = rust_library {
+    edition = "2021"
+    srcs = ["fmt.rs"]
+    deps = [
+        ":parser",
+        "//util/ggen:ggen",
+    ]
+}
+
+fmt_test = rust_test {
+    edition = "2021"
+    root_source = "fmt.rs"
+    srcs = ["fmt.rs"]
+    deps = [
+        ":parser",
+        "//util/ggen:ggen",
+    ]
+}
+
+bus_plugin = rust_library {
+    edition = "2021"
+    crate_name = "bus_plugin"
+    crate_type = "cdylib"
+    srcs = ["bus_plugin.rs"]
+    deps = ["//util/cbs_plugin_sdk:cbs_plugin_sdk"]
+}
+
+busfmt = rust_binary {
+    edition = "2021"
+    srcs = ["busfmt.rs"]
+    deps = [
+        ":parser",
+        ":fmt",
+        "//util/flags:flags",
+    ]
+}
+
+bus_rpc = rust_library {
+    edition = "2021"
+    srcs = [
+        "bus_rpc.rs",
+        "metal.rs",
+    ]
+    deps = [
+        ":bus",
+        "//tools/metal:metal_bus",
+    ]
+    cargo_deps = [
+        {
+            package = "bytes"
+            version = "=1.10.1"
+            default_features = false
+        },
+        {
+            package = "futures"
+            version = "=0.3.31"
+            default_features = false
+            features = ["std"]
+        },
+        {
+            package = "http-body-util"
+            version = "=0.1.3"
+            default_features = false
+        },
+        {
+            package = "hyper"
+            version = "=1.7.0"
+            default_features = false
+            features = ["client", "http1", "server"]
+        },
+        {
+            package = "hyper-rustls"
+            version = "=0.27.7"
+            default_features = false
+            features = ["http1", "ring", "webpki-roots"]
+        },
+        {
+            package = "hyper-util"
+            version = "=0.1.17"
+            default_features = false
+            features = ["client", "client-legacy", "http1", "server", "tokio"]
+        },
+        {
+            package = "rustls"
+            version = "=0.23.31"
+            default_features = false
+            features = ["std", "ring"]
+        },
+        {
+            package = "tokio"
+            version = "=1.48.0"
+            default_features = false
+            features = ["macros", "net", "rt-multi-thread", "sync", "time"]
+        },
+    ]
+}
+

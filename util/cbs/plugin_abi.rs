@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use cbs_plugin_sdk as sdk;
 
+use crate::config_file::ConfigTable;
 use crate::core::{
     BuildConfigKey, BuildOutput, BuildPlugin, BuildResult, Config, Context, DependencyPlan,
     DependencyPlannerPlugin, ExternalRequirement, ResolverPlugin, RuleContext, RulePlugin, Task,
@@ -61,7 +62,7 @@ impl RulePlugin for AbiRulePlugin {
         &self,
         context: &RuleContext,
         kind: &str,
-        target: &toml::Table,
+        target: &ConfigTable,
     ) -> std::io::Result<Config> {
         let request = sdk::ParseRuleRequest {
             workspace_root: context.workspace_root.clone(),
@@ -383,20 +384,16 @@ fn owned_buffer_bytes(
     bytes
 }
 
-fn string_fields(target: &toml::Table) -> HashMap<String, String> {
+fn string_fields(target: &ConfigTable) -> HashMap<String, String> {
     target
         .iter()
-        .filter_map(|(key, value)| {
-            value
-                .as_str()
-                .map(|value| (key.to_string(), value.to_string()))
-        })
+        .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string())))
         .collect()
 }
 
 fn label_fields(
     context: &RuleContext,
-    target: &toml::Table,
+    target: &ConfigTable,
     fields: &[String],
 ) -> std::io::Result<HashMap<String, String>> {
     let mut labels = HashMap::new();

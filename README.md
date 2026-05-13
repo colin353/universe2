@@ -1,6 +1,6 @@
 # universe2 build guide
 
-This workspace is built with CBS, a small experimental build system. CBS is intentionally not Cargo, Bazel, or Make: targets are declared in `BUILD.toml`, workspace settings live in `WORKSPACE.toml`, and Rust code is compiled by invoking `rustc` directly through CBS plugins.
+This workspace is built with CBS, a small experimental build system. CBS is intentionally not Cargo, Bazel, or Make: targets are declared in `BUILD.ccl`, workspace settings live in `WORKSPACE.ccl`, and Rust code is compiled by invoking `rustc` directly through CBS plugins.
 
 ## Quick start
 
@@ -13,14 +13,14 @@ cbs test //util/...
 cbs run //util/bus:busfmt -- --help
 ```
 
-CBS discovers the workspace by walking up from the current directory until it finds `WORKSPACE.toml`.
+CBS discovers the workspace by walking up from the current directory until it finds `WORKSPACE.ccl`.
 
 ## Required plugins
 
 CBS loads build rules from dynamic plugins:
 
 - The Rust plugin is implicit and is loaded from `/tmp/rust.cdylib`.
-- The Bus plugin is configured in `WORKSPACE.toml` and is loaded from `/tmp/bus.cdylib`.
+- The Bus plugin is configured in `WORKSPACE.ccl` and is loaded from `/tmp/bus.cdylib`.
 
 If a plugin is stale, rebuild and copy it into place:
 
@@ -52,7 +52,7 @@ cbs install <target>
 
 `build` accepts one or more targets or recursive patterns. It expands all requested targets first, constructs one combined build graph, builds it, and prints output paths on success.
 
-`test` also accepts targets or recursive patterns, but it only builds targets marked as tests by plugins. For Rust, that means `[[rust_test]]`. Regular libraries and binaries matched by a pattern are ignored. Each test target is compiled as an executable with Rust's `--test` mode and passes when the executable exits with status 0. Failing test logs are printed.
+`test` also accepts targets or recursive patterns, but it only builds targets marked as tests by plugins. For Rust, that means targets with `_type = "rust_test"`. Regular libraries and binaries matched by a pattern are ignored. Each test target is compiled as an executable with Rust's `--test` mode and passes when the executable exits with status 0. Failing test logs are printed.
 
 `run` builds one target and executes its first output. Arguments after `--` are passed to the executable.
 
@@ -77,50 +77,59 @@ cbs test //util/bus/...
 cbs build //util/cbs:cbs //util/bus:busfmt
 ```
 
-The recursive `...` form scans packages below that directory for `BUILD.toml` files and expands to matching target kinds.
+The recursive `...` form scans packages below that directory for `BUILD.ccl` files and expands to matching target kinds.
 
 ## Workspace configuration
 
-`WORKSPACE.toml` configures the cache, toolchain, plugins, and target platform:
+`WORKSPACE.ccl` configures the cache, toolchain, plugins, and target platform:
 
-```toml
-[workspace]
-cache_dir = ".cbs/cache"
+```ccl
+workspace = {
+    cache_dir = ".cbs/cache"
+}
 
-[toolchain.rust]
-rustc = "rustc"
+toolchain = {
+    rust = {
+        rustc = "rustc"
+    }
+}
 
-[[plugins]]
-name = "bus"
-path = "/tmp/bus.cdylib"
+plugins = [
+    {
+        name = "bus"
+        path = "/tmp/bus.cdylib"
+    },
+]
 
-[target]
-family = "unix"
-os = "macos"
-env = ""
-arch = "aarch64"
-vendor = "apple"
-endian = "little"
+target = {
+    family = "unix"
+    os = "macos"
+    env = ""
+    arch = "aarch64"
+    vendor = "apple"
+    endian = "little"
+}
 ```
 
-`cache_dir` is where CBS stores resolved external dependencies and build outputs. The Rust plugin path is currently implicit as `/tmp/rust.cdylib`; additional plugins are listed with `[[plugins]]`.
+`cache_dir` is where CBS stores resolved external dependencies and build outputs. The Rust plugin path is currently implicit as `/tmp/rust.cdylib`; additional plugins are listed in `plugins`.
 
-## BUILD.toml files
+## BUILD.ccl files
 
-Each package may contain a `BUILD.toml`. Targets are TOML arrays of tables such as `[[rust_library]]`, `[[rust_binary]]`, `[[rust_test]]`, and `[[rust_bus_library]]`.
+Each package may contain a `BUILD.ccl`. Targets are top-level CCL bindings whose values are rule prototype expansions. Import the shared CBS rule prototypes from `//util/cbs:build_defs.ccl`.
 
 Source paths are package-relative. Do not use absolute paths or `..` in source paths.
 
 ### Rust libraries
 
-```toml
-[[rust_library]]
-name = "flags"
-edition = "2018"
-srcs = [
-  "lib.rs",
-  "parse.rs",
-]
+```ccl
+import { rust_library } from "//util/cbs:build_defs.ccl"
+
+flags = rust_library {
+    srcs = [
+        "lib.rs",
+        "parse.rs",
+    ]
+}
 ```
 
 By default a library uses `lib.rs` or `<name>.rs` as the crate root. Use `root_source` when the root is different.
@@ -134,32 +143,34 @@ Optional fields:
 
 ### Rust binaries
 
-```toml
-[[rust_binary]]
-name = "busfmt"
-edition = "2021"
-srcs = ["busfmt.rs"]
-deps = [
-  ":parser",
-  ":fmt",
-  "//util/flags:flags",
-]
+```ccl
+import { rust_binary } from "//util/cbs:build_defs.ccl"
+
+busfmt = rust_binary {
+    srcs = ["busfmt.rs"]
+    deps = [
+        ":parser",
+        ":fmt",
+        "//util/flags:flags",
+    ]
+}
 ```
 
 By default a binary uses `main.rs` or `<name>.rs` as the root source. `root_source` can override this.
 
 ### Rust tests
 
-```toml
-[[rust_test]]
-name = "parser_test"
-edition = "2021"
-root_source = "parser.rs"
-srcs = [
-  "parser.rs",
-  "ast.rs",
-]
-deps = ["//util/ggen:ggen"]
+```ccl
+import { rust_test } from "//util/cbs:build_defs.ccl"
+
+parser_test = rust_test {
+    root_source = "parser.rs"
+    srcs = [
+        "parser.rs",
+        "ast.rs",
+    ]
+    deps = ["//util/ggen:ggen"]
+}
 ```
 
 Rust tests are compiled with `rustc --test`, so normal `#[test]` functions are discovered and run by the produced executable.
@@ -168,10 +179,18 @@ Rust tests are compiled with `rustc --test`, so normal `#[test]` functions are d
 
 Use `cargo_deps` for crates from crates.io:
 
-```toml
+```ccl
 cargo_deps = [
-  { package = "tokio", version = "=1.48.0", default_features = false, features = ["macros", "rt-multi-thread"] },
-  { package = "serde_json", version = "=1.0.117" },
+    {
+        package = "tokio"
+        version = "=1.48.0"
+        default_features = false
+        features = ["macros", "rt-multi-thread"]
+    },
+    {
+        package = "serde_json"
+        version = "=1.0.117"
+    },
 ]
 ```
 
@@ -187,13 +206,14 @@ CBS plans Cargo dependencies for the whole build invocation, then resolves `carg
 
 ### Bus libraries
 
-The Bus plugin adds `[[rust_bus_library]]` for `.bus` schemas:
+The Bus plugin adds `rust_bus_library` for `.bus` schemas:
 
-```toml
-[[rust_bus_library]]
-name = "fortune_bus"
-edition = "2021"
-srcs = ["fortune.bus"]
+```ccl
+import { rust_bus_library } from "//util/cbs:build_defs.ccl"
+
+fortune_bus = rust_bus_library {
+    srcs = ["fortune.bus"]
+}
 ```
 
 This rule expects exactly one `.bus` source. It runs the Bus code generator and produces a Rust library. By default it depends on `//util/bus:bus` and `//util/bus/codegen:codegen`; these can be overridden with `bus_runtime` and `codegen` label fields when needed.

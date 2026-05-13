@@ -5,6 +5,7 @@ mod bus;
 mod cargo;
 #[cfg(test)]
 mod cargo_recipes;
+mod config_file;
 mod context;
 mod core;
 mod exec;

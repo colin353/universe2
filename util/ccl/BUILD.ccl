@@ -1,0 +1,49 @@
+import { rust_library, rust_binary, rust_test } from "//util/cbs:build_defs.ccl"
+
+ccl = rust_library {
+    edition = "2018"
+    srcs = [
+        "lib.rs",
+        "ast.rs",
+        "import_resolver.rs",
+        "fmt.rs",
+        "exec.rs",
+        "eval.rs",
+        "eval_tests.rs",
+    ]
+    deps = ["//util/ggen:ggen"]
+}
+
+cclfmt = rust_binary {
+    edition = "2018"
+    srcs = ["cclfmt.rs"]
+    deps = [
+        ":ccl",
+        "//util/flags:flags",
+    ]
+}
+
+cclc = rust_binary {
+    edition = "2018"
+    srcs = ["cclc.rs"]
+    deps = [
+        ":ccl",
+        "//util/flags:flags",
+    ]
+}
+
+ccl_test = rust_test {
+    edition = "2018"
+    root_source = "lib.rs"
+    srcs = [
+        "lib.rs",
+        "ast.rs",
+        "import_resolver.rs",
+        "fmt.rs",
+        "exec.rs",
+        "eval.rs",
+        "eval_tests.rs",
+    ]
+    deps = ["//util/ggen:ggen"]
+}
+

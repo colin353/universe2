@@ -263,41 +263,42 @@ impl<'a> Scope<'a> {
             .partially_resolve(specifier, offset)
             .map(|vos| match vos {
                 ValueOrScope::Value(v) => Ok(v),
-                ValueOrScope::Scope(s) => {
-                    let scope = if let Some(o) =
-                        self.inner.try_lock().unwrap().deep_overrides.get(specifier)
-                    {
-                        let updated = s.duplicate();
-                        for (key, (scope, expr)) in o.iter() {
-                            let mut components_iter = key.split(".");
-                            let first = components_iter.next().unwrap_or("").to_string();
-                            let rest = components_iter.collect::<Vec<_>>().join(".");
-
-                            let mut entry = HashMap::new();
-                            entry.insert(rest, (scope.clone(), expr.clone()));
-                            updated.add_deep_overrides(first, &entry);
-                        }
-                        updated
-                    } else {
-                        s
-                    };
-
-                    let mut out = Dictionary::new();
-                    for key in scope.keys() {
-                        let value = match scope.resolve(&key, 0) {
-                            Ok(v) => v,
-                            Err(e) => return Err(e),
-                        };
-                        out.insert(key, value);
-                    }
-
-                    Ok(Value::Dictionary(out))
-                }
+                ValueOrScope::Scope(s) => self.resolve_scope_value(specifier, s),
             });
         match out {
             Ok(r) => r,
             Err(e) => Err(e),
         }
+    }
+
+    pub fn resolve_scope_value(
+        &self,
+        specifier: &str,
+        scope: Scope<'a>,
+    ) -> Result<Value, ExecError> {
+        let scope = if let Some(o) = self.inner.try_lock().unwrap().deep_overrides.get(specifier) {
+            let updated = scope.duplicate();
+            for (key, (scope, expr)) in o.iter() {
+                let mut components_iter = key.split(".");
+                let first = components_iter.next().unwrap_or("").to_string();
+                let rest = components_iter.collect::<Vec<_>>().join(".");
+
+                let mut entry = HashMap::new();
+                entry.insert(rest, (scope.clone(), expr.clone()));
+                updated.add_deep_overrides(first, &entry);
+            }
+            updated
+        } else {
+            scope
+        };
+
+        let mut out = Dictionary::new();
+        for key in scope.keys() {
+            let value = scope.resolve(&key, 0)?;
+            out.insert(key, value);
+        }
+
+        Ok(Value::Dictionary(out))
     }
 
     pub fn partially_resolve(
@@ -452,6 +453,7 @@ impl<'a> Scope<'a> {
                         import_resolution.content.into(),
                     );
                     tmp.add_import_resolvers(_inner.import_resolvers.clone());
+                    tmp.set_import_context(import_resolution.context);
 
                     return match import {
                         ImportedIdentifier::Direct(_) => tmp.partially_resolve(specifier, 0),
@@ -509,6 +511,10 @@ impl<'a> Scope<'a> {
         self.inner.lock().unwrap().import_resolvers = resolvers;
     }
 
+    pub fn set_import_context(&self, context: Option<String>) {
+        self.inner.lock().unwrap().import_context = context;
+    }
+
     pub fn set_parent(&self, parent: &Scope<'a>) {
         self.inner.lock().unwrap().parent_scope = Some(parent.clone());
     }
@@ -520,8 +526,19 @@ pub fn exec_with_import_resolvers(
     specifier: &str,
     resolvers: Vec<Arc<dyn ImportResolver>>,
 ) -> Result<Value, ExecError> {
+    exec_with_import_resolvers_and_context(module, content, specifier, resolvers, None)
+}
+
+pub fn exec_with_import_resolvers_and_context(
+    module: ast::Module,
+    content: &str,
+    specifier: &str,
+    resolvers: Vec<Arc<dyn ImportResolver>>,
+    import_context: Option<String>,
+) -> Result<Value, ExecError> {
     let root = Scope::from_module(module, content.into());
     root.add_import_resolvers(resolvers);
+    root.set_import_context(import_context);
     root.resolve(specifier, 0)
 }
 

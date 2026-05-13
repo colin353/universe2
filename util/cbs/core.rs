@@ -4,6 +4,8 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::config_file::ConfigTable;
+
 #[derive(Debug, Clone)]
 pub struct Context {
     pub start_time: std::time::Instant,
@@ -300,7 +302,7 @@ pub trait RulePlugin: std::fmt::Debug + Send + Sync {
         &self,
         context: &RuleContext,
         kind: &str,
-        target: &toml::Table,
+        target: &ConfigTable,
     ) -> std::io::Result<Config>;
 }
 

@@ -1,8 +1,6 @@
 use crate::exec::{ExecError, Scope, ValueOrScope};
 use crate::{ast, Value};
-use ggen::ParseError;
-
-use ggen::GrammarUnit;
+use ggen::{GrammarUnit, ParseError};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -92,17 +90,7 @@ pub fn evaluate<'a>(
 
                 for expr in elements {
                     let inner = match evaluate(expr, content.clone(), dependencies, context)? {
-                        ValueOrScope::Scope(_) => {
-                            let (start, end) = expr.range();
-                            return Err(ExecError::ArraysCannotContainDictionaries(
-                                ParseError::with_message(
-                                    "dictionaries within arrays are unsupported",
-                                    "",
-                                    start,
-                                    end,
-                                ),
-                            ));
-                        }
+                        ValueOrScope::Scope(scope) => context.resolve_scope_value("", scope)?,
                         ValueOrScope::Value(value) => value,
                     };
                     output.push(inner);

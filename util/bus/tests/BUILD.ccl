@@ -1,0 +1,26 @@
+import { rust_bus_library, rust_library, rust_test } from "//util/cbs:build_defs.ccl"
+
+battery = rust_bus_library {
+    edition = "2021"
+    srcs = ["battery.bus"]
+}
+
+encoding = rust_library {
+    edition = "2021"
+    srcs = ["encoding.rs"]
+    deps = [
+        ":battery",
+        "//util/bus:bus",
+    ]
+}
+
+encoding_test = rust_test {
+    edition = "2021"
+    root_source = "encoding.rs"
+    srcs = ["encoding.rs"]
+    deps = [
+        ":battery",
+        "//util/bus:bus",
+    ]
+}
+
