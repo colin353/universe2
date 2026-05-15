@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 pub const CBS_PLUGIN_ABI_VERSION: u32 = 1;
 
@@ -144,6 +145,7 @@ pub struct BuildRequest {
     pub config: Config,
     pub dependencies: HashMap<String, BuildOutput>,
     pub working_directory: PathBuf,
+    pub tool_paths: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -178,6 +180,7 @@ pub struct PluginContext {
     pub cache_dir: PathBuf,
     pub context_hash: u64,
     pub target_config: HashMap<u32, String>,
+    pub tool_paths: HashMap<String, String>,
     pub lockfile: HashMap<String, String>,
     pub locked_dependencies: HashMap<String, HashMap<String, String>>,
     pub target: Option<String>,
@@ -223,12 +226,53 @@ impl PluginContext {
         }
     }
 
+    pub fn run_tool<S>(&self, tool: &str, args: &[S]) -> std::io::Result<Vec<u8>>
+    where
+        S: AsRef<str>,
+    {
+        let Some(path) = self.tool_paths.get(tool) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("tool {tool:?} is not declared"),
+            ));
+        };
+        let bin = materialize_declared_tools(self)?.join(tool);
+        if !bin.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("declared tool {tool:?} is not available at {path}"),
+            ));
+        }
+        self.run_resolved_process(bin, args, true)
+    }
+
     pub fn run_process<P: Into<PathBuf>, S>(&self, bin: P, args: &[S]) -> std::io::Result<Vec<u8>>
     where
         S: AsRef<str>,
     {
-        let bin = resolve_command(bin.into());
+        let bin = bin.into();
+        if bin.components().count() == 1 {
+            if let Some(tool) = bin.to_str().filter(|tool| self.tool_paths.contains_key(*tool)) {
+                return self.run_tool(tool, args);
+            }
+        }
+        let bin = resolve_command(bin)?;
+        self.run_resolved_process(bin, args, false)
+    }
+
+    fn run_resolved_process<S>(
+        &self,
+        bin: PathBuf,
+        args: &[S],
+        hermetic: bool,
+    ) -> std::io::Result<Vec<u8>>
+    where
+        S: AsRef<str>,
+    {
         let mut command = std::process::Command::new(&bin);
+        if hermetic {
+            configure_hermetic_env(self, &mut command)?;
+        }
         let mut cmd_debug = bin.to_string_lossy().to_string();
         for arg in args {
             cmd_debug.push(' ');
@@ -272,24 +316,134 @@ impl PluginContext {
             dest.to_string_lossy().to_string(),
             url.as_ref().to_string(),
         ];
-        self.run_process("curl", &args).map(|_| ())
+        if self.tool_paths.contains_key("curl") {
+            self.run_tool("curl", &args).map(|_| ())
+        } else {
+            self.run_process("curl", &args).map(|_| ())
+        }
     }
 }
 
-fn resolve_command(bin: PathBuf) -> PathBuf {
+fn configure_hermetic_env(
+    context: &PluginContext,
+    command: &mut std::process::Command,
+) -> std::io::Result<()> {
+    let bin_dir = materialize_declared_tools(context)?;
+    command.env_clear();
+    command.env("PATH", &bin_dir);
+    command.env("TMPDIR", context.working_directory().join("tmp"));
+    command.env("HOME", context.working_directory().join("home"));
+    Ok(())
+}
+
+fn materialize_declared_tools(context: &PluginContext) -> std::io::Result<PathBuf> {
+    let bin_dir = tool_bin_dir(context)?;
+    std::fs::create_dir_all(&bin_dir)?;
+    std::fs::create_dir_all(context.working_directory().join("tmp"))?;
+    std::fs::create_dir_all(context.working_directory().join("home"))?;
+    for (name, path) in &context.tool_paths {
+        let link = bin_dir.join(name);
+        if std::fs::symlink_metadata(&link).is_ok() {
+            std::fs::remove_file(&link)?;
+        }
+        symlink_or_copy(Path::new(path), &link)?;
+    }
+    Ok(bin_dir)
+}
+
+fn tool_bin_dir(context: &PluginContext) -> std::io::Result<PathBuf> {
+    Ok(context
+        .working_directory()
+        .join(".cbs-tools")
+        .join(format!("{:016x}", context.context_hash)))
+}
+
+#[cfg(unix)]
+fn symlink_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+}
+
+#[cfg(not(unix))]
+fn symlink_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::copy(src, dst).map(|_| ())
+}
+
+fn resolve_command(bin: PathBuf) -> std::io::Result<PathBuf> {
     if bin.components().count() != 1 {
-        return bin;
+        diagnose_command(&bin, "plugin action")?;
+        return Ok(bin);
     }
     let Some(name) = bin.to_str() else {
-        return bin;
+        return Ok(bin);
     };
-    for dir in ["/usr/bin", "/bin", "/usr/local/bin"] {
+    diagnose_command(&bin, "plugin action")?;
+    const DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin"];
+    diagnose_host_path_search(name, DIRS)?;
+    for dir in DIRS {
         let candidate = Path::new(dir).join(name);
         if candidate.exists() {
-            return candidate;
+            diagnose_command(&candidate, "plugin action")?;
+            return Ok(candidate);
         }
     }
-    bin
+    Ok(bin)
+}
+
+static TOOL_WARNINGS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn strict_tools_enabled() -> bool {
+    std::env::var_os("CBS_STRICT_TOOLS").is_some_and(|value| value != "0")
+}
+
+fn diagnose_command(program: &Path, context: &str) -> std::io::Result<()> {
+    if program.components().count() == 1 {
+        return report_tool_violation(format!(
+            "{context} uses undeclared bare host tool `{}`",
+            program.display()
+        ));
+    }
+
+    if is_known_host_tool_path(program) {
+        return report_tool_violation(format!(
+            "{context} uses undeclared host tool path `{}`",
+            program.display()
+        ));
+    }
+
+    Ok(())
+}
+
+fn diagnose_host_path_search(tool: &str, dirs: &[&str]) -> std::io::Result<()> {
+    report_tool_violation(format!(
+        "searching host paths [{}] for undeclared tool `{tool}`",
+        dirs.join(", ")
+    ))
+}
+
+fn report_tool_violation(message: String) -> std::io::Result<()> {
+    if strict_tools_enabled() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("strict tools violation: {message}"),
+        ));
+    }
+
+    let warnings = TOOL_WARNINGS.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if warnings
+        .lock()
+        .expect("tool warning lock poisoned")
+        .insert(message.clone())
+    {
+        eprintln!("[cbs] warning: non-hermetic tool use: {message}");
+    }
+    Ok(())
+}
+
+fn is_known_host_tool_path(program: &Path) -> bool {
+    ["/usr/bin", "/bin", "/usr/local/bin"]
+        .iter()
+        .map(Path::new)
+        .any(|dir| program.starts_with(dir))
 }
 
 fn to_dir(s: &str) -> String {
@@ -394,6 +548,7 @@ pub fn encode_build_request(request: &BuildRequest) -> Vec<u8> {
         &request.config,
         &request.dependencies,
         &request.working_directory,
+        &request.tool_paths,
     )
 }
 
@@ -402,10 +557,17 @@ pub fn encode_build_request_parts(
     config: &Config,
     dependencies: &HashMap<String, BuildOutput>,
     working_directory: &Path,
+    tool_paths: &HashMap<String, String>,
 ) -> Vec<u8> {
     let mut fbb = flatbuffers::FlatBufferBuilder::new();
-    let root =
-        fb::create_build_request_parts(&mut fbb, target, config, dependencies, working_directory);
+    let root = fb::create_build_request_parts(
+        &mut fbb,
+        target,
+        config,
+        dependencies,
+        working_directory,
+        tool_paths,
+    );
     fbb.finish_minimal(root);
     fbb.finished_data().to_vec()
 }
@@ -752,6 +914,7 @@ mod fb {
         const VT_CONFIG: VOffsetT = VT_FIRST + 2;
         const VT_DEPENDENCIES: VOffsetT = VT_FIRST + 4;
         const VT_WORKING_DIRECTORY: VOffsetT = VT_FIRST + 6;
+        const VT_TOOL_PATHS: VOffsetT = VT_FIRST + 8;
     }
 
     impl<'a> BuildResponse<'a> {
@@ -786,6 +949,7 @@ mod fb {
         const VT_TARGET_CONFIG: VOffsetT = VT_FIRST + 4;
         const VT_LOCKFILE: VOffsetT = VT_FIRST + 6;
         const VT_LOCKED_DEPENDENCIES: VOffsetT = VT_FIRST + 8;
+        const VT_TOOL_PATHS: VOffsetT = VT_FIRST + 10;
     }
 
     impl<'a> DependencyEdgeSet<'a> {
@@ -962,6 +1126,7 @@ mod fb {
             &request.config,
             &request.dependencies,
             &request.working_directory,
+            &request.tool_paths,
         )
     }
 
@@ -971,17 +1136,20 @@ mod fb {
         config: &CoreConfig,
         dependencies: &HashMap<String, CoreBuildOutput>,
         working_directory: &Path,
+        tool_paths: &HashMap<String, String>,
     ) -> WIPOffset<BuildRequest<'a>> {
         let target = fbb.create_string(target);
         let config = create_config(fbb, config);
         let dependencies = create_dependency_output_vector(fbb, dependencies);
         let working_directory = fbb.create_string(&working_directory.display().to_string());
+        let tool_paths = create_string_field_vector(fbb, tool_paths);
 
         let start = fbb.start_table();
         fbb.push_slot_always(BuildRequest::VT_TARGET, target);
         fbb.push_slot_always(BuildRequest::VT_CONFIG, config);
         fbb.push_slot_always(BuildRequest::VT_DEPENDENCIES, dependencies);
         fbb.push_slot_always(BuildRequest::VT_WORKING_DIRECTORY, working_directory);
+        fbb.push_slot_always(BuildRequest::VT_TOOL_PATHS, tool_paths);
         finish_table(fbb, start)
     }
 
@@ -1017,6 +1185,14 @@ mod fb {
                 request.table,
                 BuildRequest::VT_WORKING_DIRECTORY,
             )),
+            tool_paths: read_string_fields(unsafe {
+                request
+                    .table
+                    .get::<ForwardsUOffset<Vector<'_, ForwardsUOffset<StringField<'_>>>>>(
+                        BuildRequest::VT_TOOL_PATHS,
+                        None,
+                    )
+            }),
         }
     }
 
@@ -1404,6 +1580,7 @@ mod fb {
     ) -> WIPOffset<PluginContext<'a>> {
         let cache_dir = fbb.create_string(&context.cache_dir.display().to_string());
         let target_config = create_target_config_vector(fbb, &context.target_config);
+        let tool_paths = create_string_field_vector(fbb, &context.tool_paths);
         let lockfile = create_string_field_vector(fbb, &context.lockfile);
         let locked_dependencies =
             create_locked_dependencies_vector(fbb, &context.locked_dependencies);
@@ -1414,6 +1591,7 @@ mod fb {
         fbb.push_slot_always(PluginContext::VT_TARGET_CONFIG, target_config);
         fbb.push_slot_always(PluginContext::VT_LOCKFILE, lockfile);
         fbb.push_slot_always(PluginContext::VT_LOCKED_DEPENDENCIES, locked_dependencies);
+        fbb.push_slot_always(PluginContext::VT_TOOL_PATHS, tool_paths);
         finish_table(fbb, start)
     }
 
@@ -1431,6 +1609,14 @@ mod fb {
                     .table
                     .get::<ForwardsUOffset<Vector<'_, ForwardsUOffset<Extra<'_>>>>>(
                         PluginContext::VT_TARGET_CONFIG,
+                        None,
+                    )
+            }),
+            tool_paths: read_string_fields(unsafe {
+                context
+                    .table
+                    .get::<ForwardsUOffset<Vector<'_, ForwardsUOffset<StringField<'_>>>>>(
+                        PluginContext::VT_TOOL_PATHS,
                         None,
                     )
             }),
@@ -1724,6 +1910,7 @@ mod fb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
 
     const TRANSITIVE_PRODUCTS: u32 = 0;
     const EDITION: u32 = 3;
@@ -1791,6 +1978,9 @@ mod tests {
             },
             dependencies,
             working_directory: PathBuf::from("/tmp/cbs/schema"),
+            tool_paths: [("busfmt".to_string(), "/declared/busfmt".to_string())]
+                .into_iter()
+                .collect(),
         };
 
         assert_eq!(
@@ -1861,6 +2051,9 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/cache"),
             context_hash: 123,
             target_config,
+            tool_paths: [("cargo".to_string(), "/declared/cargo".to_string())]
+                .into_iter()
+                .collect(),
             lockfile,
             locked_dependencies,
             target: None,
@@ -1914,5 +2107,30 @@ mod tests {
             .unwrap(),
             ResolveTargetResponse::Success(config)
         );
+    }
+
+    #[test]
+    fn strict_tools_rejects_bare_command_resolution() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::set_var("CBS_STRICT_TOOLS", "1");
+        let err = resolve_command(PathBuf::from("definitely-not-declared-tool")).unwrap_err();
+        std::env::remove_var("CBS_STRICT_TOOLS");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("strict tools violation"));
+    }
+
+    #[test]
+    fn compatibility_mode_allows_bare_command_resolution() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::remove_var("CBS_STRICT_TOOLS");
+        let resolved = resolve_command(PathBuf::from("definitely-not-declared-tool")).unwrap();
+
+        assert_eq!(resolved, PathBuf::from("definitely-not-declared-tool"));
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
     }
 }

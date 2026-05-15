@@ -2,6 +2,39 @@ workspace = {
     cache_dir = ".cbs/cache"
 }
 
+tools = {
+    rustc = {
+        _type = "host_tool"
+        path = "/Users/colinwm/.rustup/toolchains/1.91.1-aarch64-apple-darwin/bin/rustc"
+        sha256 = "f556cd7caa76d85ff0e777ba8e96552b33b4e0ea0dda8fbe6cde1d23b6c4df27"
+    }
+    cargo = {
+        _type = "host_tool"
+        path = "/Users/colinwm/.rustup/toolchains/1.91.1-aarch64-apple-darwin/bin/cargo"
+        sha256 = "696d29bd6f5a136ef6c7088558e178efcabbd571de90e8169d0f6596c568eea8"
+    }
+    curl = {
+        _type = "host_tool"
+        path = "/usr/bin/curl"
+        sha256 = "5ef748580e05e8208c8faacc9be88d1aa48d9970101c0a29ba26896e017e6226"
+    }
+    tar = {
+        _type = "host_tool"
+        path = "/usr/bin/tar"
+        sha256 = "bdccb76a715fbebc4915a1a1b1de0e7050ad842ebb730c47935b3a22c13e3af9"
+    }
+    cc = {
+        _type = "host_tool"
+        path = "/usr/bin/cc"
+        sha256 = "12bed4523661307059b879b9b54e77a73176e9d27d27a0e40363271d8f0668ba"
+    }
+    ar = {
+        _type = "host_tool"
+        path = "/usr/bin/ar"
+        sha256 = "12bed4523661307059b879b9b54e77a73176e9d27d27a0e40363271d8f0668ba"
+    }
+}
+
 toolchain = {
     rust = {
         rustc = "rustc"
@@ -23,4 +56,3 @@ target = {
     vendor = "apple"
     endian = "little"
 }
-

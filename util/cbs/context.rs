@@ -1,4 +1,4 @@
-use crate::core::{BuildActions, BuildConfigKey, Context, Task};
+use crate::core::{BuildActions, BuildConfigKey, Context, Task, Tool};
 use sha2::Digest;
 
 use std::collections::HashMap;
@@ -19,8 +19,23 @@ impl Context {
             target_hash: None,
             logs: Arc::new(RwLock::new(HashMap::new())),
             config: Arc::new(config.into_iter().collect()),
+            tools: Arc::new(HashMap::new()),
+            tool_fingerprints: Arc::new(Vec::new()),
             hash: 0,
         }
+    }
+
+    pub fn with_tools<T: IntoIterator<Item = (String, Tool)>>(mut self, tools: T) -> Self {
+        self.tools = Arc::new(tools.into_iter().collect());
+        self
+    }
+
+    pub fn with_tool_fingerprints<T: IntoIterator<Item = (String, String)>>(
+        mut self,
+        tool_fingerprints: T,
+    ) -> Self {
+        self.tool_fingerprints = Arc::new(tool_fingerprints.into_iter().collect());
+        self
     }
 
     pub fn get_config(&self, key: BuildConfigKey) -> Option<&str> {
@@ -34,6 +49,14 @@ impl Context {
         for (k, v) in cfg_values {
             hasher.update((*k as u32).to_be_bytes());
             hasher.update(v.as_bytes());
+        }
+        let mut tool_fingerprints: Vec<_> = self.tool_fingerprints.iter().collect();
+        tool_fingerprints.sort_by_key(|(name, _)| name.as_str());
+        for (name, fingerprint) in tool_fingerprints {
+            hasher.update(name.as_bytes());
+            hasher.update([0]);
+            hasher.update(fingerprint.as_bytes());
+            hasher.update([0]);
         }
         self.hash = u64::from_be_bytes(
             hasher.finalize()[..8]

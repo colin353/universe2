@@ -17,7 +17,15 @@ pub struct Context {
     pub target_hash: Option<u64>,
     pub logs: Arc<RwLock<HashMap<String, Mutex<Vec<String>>>>>,
     pub config: Arc<HashMap<BuildConfigKey, String>>,
+    pub tools: Arc<HashMap<String, Tool>>,
+    pub tool_fingerprints: Arc<Vec<(String, String)>>,
     pub hash: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tool {
+    pub path: PathBuf,
+    pub fingerprint: String,
 }
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]

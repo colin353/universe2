@@ -16,6 +16,7 @@ cbs = rust_binary {
         "plugin_abi.rs",
         "plugins.rs",
         "rust_plugin.rs",
+        "tool_diagnostics.rs",
         "workspace.rs",
     ]
     deps = [

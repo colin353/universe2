@@ -266,11 +266,17 @@ impl BuildPlugin for AbiBuildPlugin {
             .map(|(target, output)| (target.clone(), build_output_to_sdk(output)))
             .collect();
         let working_directory = context.working_directory();
+        let tool_paths: HashMap<String, String> = context
+            .tools
+            .iter()
+            .map(|(name, tool)| (name.clone(), tool.path.to_string_lossy().to_string()))
+            .collect();
         let request = sdk::encode_build_request_parts(
             &task.target,
             &config_to_sdk(config),
             &dependencies,
             &working_directory,
+            &tool_paths,
         );
         let response_buffer = (self.plugin.build)(sdk::CbsSlice::from_slice(&request));
         let response = owned_buffer_bytes(response_buffer, self.plugin.free_buffer);
@@ -501,6 +507,11 @@ fn plugin_context_to_sdk(context: &Context) -> sdk::PluginContext {
             .config
             .iter()
             .map(|(key, value)| (build_config_key_to_sdk(*key), value.clone()))
+            .collect(),
+        tool_paths: context
+            .tools
+            .iter()
+            .map(|(name, tool)| (name.clone(), tool.path.to_string_lossy().to_string()))
             .collect(),
         lockfile: context.lockfile.as_ref().clone(),
         locked_dependencies: context.locked_dependencies.as_ref().clone(),

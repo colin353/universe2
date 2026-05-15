@@ -249,6 +249,11 @@ fn core_context_to_sdk(context: &crate::core::Context) -> PluginContext {
             .iter()
             .map(|(key, value)| (*key as u32, value.clone()))
             .collect(),
+        tool_paths: context
+            .tools
+            .iter()
+            .map(|(name, tool)| (name.clone(), tool.path.to_string_lossy().to_string()))
+            .collect(),
         lockfile: context.lockfile.as_ref().clone(),
         locked_dependencies: context.locked_dependencies.as_ref().clone(),
         target: context.target.clone(),
@@ -342,7 +347,7 @@ impl CargoDependencyPlanner {
         }
 
         let output = context
-            .run_process("cargo", &args)
+            .run_tool("cargo", &args)
             .map_err(|e| std::io::Error::new(e.kind(), format!("cargo metadata failed: {e}")))?;
         let plan = metadata_to_dependency_plan(&context, requirements, &output)?;
         write_cached_dependency_plan(&plan_cache, &plan)?;
@@ -1481,7 +1486,7 @@ impl CargoResolver {
                 std::fs::remove_dir_all(&dest)?;
             }
             std::fs::create_dir_all(&dest)?;
-            context.run_process(
+            context.run_tool(
                 "tar",
                 &[
                     "xzvf",

@@ -1,7 +1,246 @@
-import { rust_bus_library } from "//util/cbs:build_defs.ccl"
+import { rust_bus_library, rust_library, rust_binary, rust_test } from "//util/cbs:build_defs.ccl"
 
 metal_bus = rust_bus_library {
     edition = "2021"
     srcs = ["metal.bus"]
 }
 
+core = rust_library {
+    edition = "2018"
+    srcs = ["core.rs"]
+    deps = [":metal_bus"]
+}
+
+config = rust_library {
+    edition = "2018"
+    srcs = [
+        "config.rs",
+        "metal.ccl",
+    ]
+    deps = [
+        ":metal_bus",
+        "//util/ccl:ccl",
+        "//util/ggen:ggen",
+    ]
+}
+
+config_test = rust_test {
+    edition = "2018"
+    root_source = "config.rs"
+    srcs = [
+        "config.rs",
+        "metal.ccl",
+    ]
+    deps = [
+        ":metal_bus",
+        "//util/ccl:ccl",
+        "//util/ggen:ggen",
+    ]
+}
+
+state = rust_library {
+    edition = "2018"
+    srcs = ["state.rs"]
+    deps = [
+        ":metal_bus",
+        "//util/bus:bus",
+    ]
+}
+
+diff = rust_library {
+    edition = "2018"
+    srcs = ["diff.rs"]
+    deps = [":metal_bus"]
+}
+
+service = rust_library {
+    edition = "2018"
+    srcs = ["service.rs"]
+    deps = [
+        ":metal_bus",
+        "//util/bus:bus",
+        ":core",
+        ":state",
+        ":diff",
+    ]
+}
+
+service_test = rust_test {
+    edition = "2018"
+    root_source = "service.rs"
+    srcs = ["service.rs"]
+    deps = [
+        ":metal_bus",
+        "//util/bus:bus",
+        ":core",
+        ":state",
+        ":diff",
+    ]
+}
+
+load_balancer = rust_library {
+    edition = "2021"
+    srcs = ["load_balancer.rs"]
+    cargo_deps = [
+        {
+            package = "bytes"
+            version = "=1.10.1"
+            default_features = false
+        },
+        {
+            package = "http-body-util"
+            version = "=0.1.3"
+            default_features = false
+        },
+        {
+            package = "hyper"
+            version = "=1.7.0"
+            default_features = false
+            features = ["client", "http1", "server"]
+        },
+        {
+            package = "hyper-util"
+            version = "=0.1.17"
+            default_features = false
+            features = ["client", "client-legacy", "http1", "server", "tokio"]
+        },
+        {
+            package = "rustls"
+            version = "=0.23.31"
+            default_features = false
+            features = ["std", "ring"]
+        },
+        {
+            package = "rustls-pemfile"
+            version = "=2.2.0"
+            default_features = false
+            features = ["std"]
+        },
+        {
+            package = "tokio"
+            version = "=1.48.0"
+            default_features = false
+            features = ["net", "rt"]
+        },
+        {
+            package = "tokio-rustls"
+            version = "=0.26.4"
+            default_features = false
+        },
+    ]
+}
+
+monitor = rust_library {
+    edition = "2021"
+    srcs = [
+        "monitor.rs",
+        "process.rs",
+        "rainbow.rs",
+    ]
+    deps = [
+        ":core",
+        ":metal_bus",
+    ]
+    cargo_deps = [
+        {
+            package = "bytes"
+            version = "=1.10.1"
+            default_features = false
+        },
+        {
+            package = "futures"
+            version = "=0.3.31"
+            default_features = false
+            features = ["async-await", "std"]
+        },
+        {
+            package = "http-body-util"
+            version = "=0.1.3"
+            default_features = false
+        },
+        {
+            package = "hyper"
+            version = "=1.7.0"
+            default_features = false
+            features = ["client", "http1"]
+        },
+        {
+            package = "hyper-rustls"
+            version = "=0.27.7"
+            default_features = false
+            features = ["http1", "ring", "webpki-roots"]
+        },
+        {
+            package = "hyper-util"
+            version = "=0.1.17"
+            default_features = false
+            features = ["client", "client-legacy", "http1", "tokio"]
+        },
+        {
+            package = "libc"
+            version = "=0.2.186"
+            default_features = false
+        },
+        {
+            package = "rustls"
+            version = "=0.23.31"
+            default_features = false
+            features = ["std", "ring"]
+        },
+        {
+            package = "tokio"
+            version = "=1.48.0"
+            default_features = false
+            features = ["rt"]
+        },
+    ]
+}
+
+cli = rust_binary {
+    edition = "2021"
+    srcs = ["cli.rs"]
+    deps = [
+        ":config",
+        ":diff",
+        ":core",
+        ":metal_bus",
+        "//util/flags:flags",
+        "//util/bus:bus_rpc",
+        "//util/bus:bus",
+    ]
+    cargo_deps = [
+        {
+            package = "hyper"
+            version = "=1.7.0"
+            default_features = false
+        },
+    ]
+}
+
+metal = rust_binary {
+    edition = "2021"
+    srcs = ["main.rs"]
+    deps = [
+        ":service",
+        ":state",
+        ":monitor",
+        ":metal_bus",
+        ":load_balancer",
+        "//util/bus:bus_rpc",
+        "//util/flags:flags",
+    ]
+    cargo_deps = [
+        {
+            package = "futures"
+            version = "=0.3.31"
+            default_features = false
+            features = ["async-await", "std"]
+        },
+        {
+            package = "tokio"
+            version = "=1.48.0"
+            default_features = false
+            features = ["macros", "rt-multi-thread"]
+        },
+    ]
+}

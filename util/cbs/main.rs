@@ -13,6 +13,7 @@ mod plugin_abi;
 mod plugins;
 #[cfg(test)]
 mod rust_plugin;
+mod tool_diagnostics;
 mod workspace;
 
 fn main() {
@@ -23,7 +24,12 @@ fn main() {
 }
 
 fn run() -> std::io::Result<()> {
-    let mut args = std::env::args().skip(1);
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(|arg| arg.as_str()), Some("--strict-tools")) {
+        std::env::set_var("CBS_STRICT_TOOLS", "1");
+        args.remove(0);
+    }
+    let mut args = args.into_iter();
     let Some(command) = args.next() else {
         return Err(usage_error());
     };
@@ -318,6 +324,6 @@ fn print_test_failure_logs(target: &str, output: &std::process::Output) {
 fn usage_error() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
-        "usage: cbs build <target-or-pattern>...\n       cbs test <target-or-pattern>...\n       cbs install //package:target | :target\n       cbs run //package:target | :target [-- args...]",
+        "usage: cbs [--strict-tools] build <target-or-pattern>...\n       cbs [--strict-tools] test <target-or-pattern>...\n       cbs [--strict-tools] install //package:target | :target\n       cbs [--strict-tools] run //package:target | :target [-- args...]",
     )
 }

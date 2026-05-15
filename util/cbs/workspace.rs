@@ -1,10 +1,12 @@
-use std::collections::HashSet;
+use sha2::Digest;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config_file::{load_build_table, load_workspace_table, ConfigTable, ConfigValue};
 use crate::core::{
-    BuildConfigKey, BuildResult, Config, Context, ExternalRequirement, FakeResolver,
+    BuildConfigKey, BuildResult, Config, Context, ExternalRequirement, FakeResolver, Tool,
     FilesystemBuilder, ResolverPlugin, RuleContext, RulePlugin,
 };
 use crate::exec::Executor;
@@ -31,8 +33,19 @@ pub struct BuildInvocationResult {
 struct WorkspaceConfig {
     cache_dir: PathBuf,
     rustc: String,
+    tools: HashMap<String, WorkspaceToolConfig>,
+    tool_fingerprints: Vec<(String, String)>,
     target_config: Vec<(BuildConfigKey, String)>,
     plugins: Vec<WorkspacePluginConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceToolConfig {
+    name: String,
+    kind: String,
+    path: PathBuf,
+    sha256: Option<String>,
+    fingerprint: String,
 }
 
 #[derive(Debug, Clone)]
@@ -76,7 +89,9 @@ impl Workspace {
         let mut context = Context::new(
             self.config.cache_dir.clone(),
             self.config.target_config.clone(),
-        );
+        )
+        .with_tools(context_tools(&self.config.tools))
+        .with_tool_fingerprints(self.config.tool_fingerprints.clone());
         context.calculate_hash();
 
         let mut executor = Executor::with_context(context);
@@ -697,15 +712,18 @@ fn target_tables<'a>(
 
 fn load_workspace_config(root: &Path, workspace_file: &Path) -> std::io::Result<WorkspaceConfig> {
     let table = load_workspace_table(root, workspace_file)?;
-    let rustc = table
+    let tools = workspace_tools(root, &table)?;
+    let rustc_ref = table
         .get("toolchain")
         .and_then(|value| value.as_table())
         .and_then(|toolchain| toolchain.get("rust"))
         .and_then(|value| value.as_table())
         .and_then(|rust| rust.get("rustc"))
         .and_then(|value| value.as_str())
-        .map(|rustc| root_relative(root, rustc))
-        .unwrap_or_else(|| std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string()));
+        .map(|rustc| rustc.to_string())
+        .or_else(|| std::env::var("RUSTC").ok())
+        .unwrap_or_else(|| "rustc".to_string());
+    let rustc = resolve_tool_or_path(root, &tools, &rustc_ref);
     let cache_dir = table
         .get("workspace")
         .and_then(|value| value.as_table())
@@ -717,9 +735,151 @@ fn load_workspace_config(root: &Path, workspace_file: &Path) -> std::io::Result<
     Ok(WorkspaceConfig {
         cache_dir,
         rustc,
+        tool_fingerprints: tool_fingerprints(&tools),
+        tools,
         target_config: target_config(&table),
         plugins: workspace_plugins(root, &table)?,
     })
+}
+
+fn workspace_tools(
+    root: &Path,
+    table: &ConfigTable,
+) -> std::io::Result<HashMap<String, WorkspaceToolConfig>> {
+    let Some(value) = table.get("tools") else {
+        return Ok(HashMap::new());
+    };
+    let tools = value.as_table().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "tools must be a table")
+    })?;
+    tools
+        .iter()
+        .map(|(name, value)| {
+            let tool = value.as_table().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("tools.{name} must be a table"),
+                )
+            })?;
+            let kind = tool
+                .get("_type")
+                .or_else(|| tool.get("type"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("host_tool");
+            if kind != "host_tool" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("tools.{name} has unsupported type {kind:?}; only host_tool is currently supported"),
+                ));
+            }
+            let path = root_relative_tool_path(root, &required_string(tool, "path")?);
+            let sha256 = tool
+                .get("sha256")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string());
+            let fingerprint = host_tool_fingerprint(name, kind, &path, sha256.as_deref())?;
+            Ok((
+                name.clone(),
+                WorkspaceToolConfig {
+                    name: name.clone(),
+                    kind: kind.to_string(),
+                    path,
+                    sha256,
+                    fingerprint,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn resolve_tool_or_path(
+    root: &Path,
+    tools: &HashMap<String, WorkspaceToolConfig>,
+    value: &str,
+) -> String {
+    tools
+        .get(value)
+        .map(|tool| tool.path.to_string_lossy().to_string())
+        .unwrap_or_else(|| root_relative(root, value))
+}
+
+fn tool_fingerprints(tools: &HashMap<String, WorkspaceToolConfig>) -> Vec<(String, String)> {
+    let mut fingerprints: Vec<_> = tools
+        .iter()
+        .map(|(name, tool)| (name.clone(), tool.fingerprint.clone()))
+        .collect();
+    fingerprints.sort_by(|a, b| a.0.cmp(&b.0));
+    fingerprints
+}
+
+fn context_tools(tools: &HashMap<String, WorkspaceToolConfig>) -> HashMap<String, Tool> {
+    tools
+        .iter()
+        .map(|(name, tool)| {
+            (
+                name.clone(),
+                Tool {
+                    path: tool.path.clone(),
+                    fingerprint: tool.fingerprint.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn host_tool_fingerprint(
+    name: &str,
+    kind: &str,
+    path: &Path,
+    expected_sha256: Option<&str>,
+) -> std::io::Result<String> {
+    let actual_sha256 = if path.exists() && path.is_file() {
+        Some(file_sha256(path)?)
+    } else {
+        None
+    };
+    if let (Some(expected), Some(actual)) = (expected_sha256, actual_sha256.as_deref()) {
+        if !expected.eq_ignore_ascii_case(actual) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "sha256 mismatch for tool {name} at {}: expected {expected}, got {actual}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    if expected_sha256.is_some() && actual_sha256.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "tool {name} at {} is not a readable file, cannot verify sha256",
+                path.display()
+            ),
+        ));
+    }
+    let digest = actual_sha256
+        .as_deref()
+        .or(expected_sha256)
+        .unwrap_or("unverified");
+    Ok(format!(
+        "{kind}:{}:sha256={digest}",
+        path.to_string_lossy()
+    ))
+}
+
+fn file_sha256(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn workspace_plugins(
@@ -983,6 +1143,15 @@ fn root_relative(root: &Path, path: &str) -> String {
 fn root_relative_path(root: &Path, path: &str) -> PathBuf {
     let path = Path::new(path);
     if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+fn root_relative_tool_path(root: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() || path.components().count() == 1 {
         path.to_path_buf()
     } else {
         root.join(path)

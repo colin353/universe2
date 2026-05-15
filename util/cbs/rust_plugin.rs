@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 #[path = "cargo.rs"]
 mod cargo;
@@ -154,12 +155,14 @@ fn package_source_path(package_dir: &Path, path: &str) -> std::io::Result<String
 fn build_rust_request(request: BuildRequest) -> BuildResponse {
     let name = rust_name(&request.target);
     let config = request.config;
+    let tool_paths = request.tool_paths;
     match config.kind.as_str() {
         RUST_LIBRARY => build_library(
             &request.working_directory,
             &name,
             config,
             request.dependencies,
+            &tool_paths,
         ),
         RUST_BINARY => build_executable(
             &request.working_directory,
@@ -167,6 +170,7 @@ fn build_rust_request(request: BuildRequest) -> BuildResponse {
             config,
             request.dependencies,
             false,
+            &tool_paths,
         ),
         RUST_TEST => build_executable(
             &request.working_directory,
@@ -174,6 +178,7 @@ fn build_rust_request(request: BuildRequest) -> BuildResponse {
             config,
             request.dependencies,
             true,
+            &tool_paths,
         ),
         kind => BuildResponse::Failure(format!("unsupported target kind: {kind:?}")),
     }
@@ -184,6 +189,7 @@ fn build_library(
     name: &str,
     config: Config,
     deps: HashMap<String, BuildOutput>,
+    tool_paths: &HashMap<String, String>,
 ) -> BuildResponse {
     let compiler = match compiler(&config, &deps) {
         Ok(compiler) => compiler,
@@ -215,7 +221,7 @@ fn build_library(
         Ok(root_source) => root_source,
         Err(e) => return BuildResponse::Failure(e),
     };
-    let native_libs = match build_native_static_libs(&config, working_directory) {
+    let native_libs = match build_native_static_libs(&config, working_directory, tool_paths) {
         Ok(libs) => libs,
         Err(e) => {
             return BuildResponse::Failure(format!("failed to build native static libs: {e:?}"))
@@ -240,7 +246,7 @@ fn build_library(
         "--color=always".to_string(),
     ]);
 
-    if let Err(e) = run_process(&compiler, &args, &rustc_env) {
+    if let Err(e) = run_process(&compiler, &args, &rustc_env, working_directory, tool_paths) {
         return BuildResponse::Failure(format!("failed to invoke compiler:\n{e}"));
     }
 
@@ -270,6 +276,7 @@ fn build_executable(
     config: Config,
     deps: HashMap<String, BuildOutput>,
     test: bool,
+    tool_paths: &HashMap<String, String>,
 ) -> BuildResponse {
     let compiler = match compiler(&config, &deps) {
         Ok(compiler) => compiler,
@@ -298,7 +305,7 @@ fn build_executable(
     args.push(format!("--edition={edition}"));
     args.push("--color=always".to_string());
 
-    if let Err(e) = run_process(&compiler, &args, &rustc_env) {
+    if let Err(e) = run_process(&compiler, &args, &rustc_env, working_directory, tool_paths) {
         return BuildResponse::Failure(format!("failed to invoke compiler:\n{e}"));
     }
 
@@ -529,9 +536,28 @@ fn metadata_from_working_directory(working_directory: &Path) -> String {
         .to_string()
 }
 
-fn run_process(program: &Path, args: &[String], env: &[(String, String)]) -> Result<(), String> {
+fn run_process(
+    program: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    working_directory: &Path,
+    tool_paths: &HashMap<String, String>,
+) -> Result<(), String> {
+    if !is_declared_bare_tool(program, tool_paths) {
+        diagnose_command(program, "rust plugin action").map_err(|e| e.to_string())?;
+    }
+    let program = resolved_program(program, working_directory, tool_paths)?;
+    let bin_dir = materialize_declared_tools(working_directory, tool_paths)?;
+    let tmpdir = working_directory.join("tmp");
+    let home = working_directory.join("home");
+    std::fs::create_dir_all(&tmpdir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
     let output = std::process::Command::new(program)
         .args(args)
+        .env_clear()
+        .env("PATH", bin_dir)
+        .env("TMPDIR", tmpdir)
+        .env("HOME", home)
         .envs(env.iter().map(|(key, value)| (key, value)))
         .output()
         .map_err(|e| e.to_string())?;
@@ -552,6 +578,106 @@ fn run_process(program: &Path, args: &[String], env: &[(String, String)]) -> Res
     Err(message)
 }
 
+fn is_declared_bare_tool(program: &Path, tool_paths: &HashMap<String, String>) -> bool {
+    program.components().count() == 1
+        && program
+            .to_str()
+            .is_some_and(|name| tool_paths.contains_key(name))
+}
+
+fn resolved_program(
+    program: &Path,
+    working_directory: &Path,
+    tool_paths: &HashMap<String, String>,
+) -> Result<PathBuf, String> {
+    if program.components().count() != 1 {
+        return Ok(program.to_path_buf());
+    }
+    let Some(name) = program.to_str() else {
+        return Ok(program.to_path_buf());
+    };
+    if tool_paths.contains_key(name) {
+        return Ok(materialize_declared_tools(working_directory, tool_paths)?.join(name));
+    }
+    Ok(program.to_path_buf())
+}
+
+fn materialize_declared_tools(
+    working_directory: &Path,
+    tool_paths: &HashMap<String, String>,
+) -> Result<PathBuf, String> {
+    let bin_dir = working_directory.join(".cbs-tools");
+    std::fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
+    for (name, path) in tool_paths {
+        let link = bin_dir.join(name);
+        if std::fs::symlink_metadata(&link).is_ok() {
+            std::fs::remove_file(&link).map_err(|e| e.to_string())?;
+        }
+        symlink_or_copy(Path::new(path), &link).map_err(|e| e.to_string())?;
+    }
+    Ok(bin_dir)
+}
+
+#[cfg(unix)]
+fn symlink_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+}
+
+#[cfg(not(unix))]
+fn symlink_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::copy(src, dst).map(|_| ())
+}
+
+static TOOL_WARNINGS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn strict_tools_enabled() -> bool {
+    std::env::var_os("CBS_STRICT_TOOLS").is_some_and(|value| value != "0")
+}
+
+fn diagnose_command(program: &Path, context: &str) -> std::io::Result<()> {
+    if program.components().count() == 1 {
+        return report_tool_violation(format!(
+            "{context} uses undeclared bare host tool `{}`",
+            program.display()
+        ));
+    }
+
+    if is_known_host_tool_path(program) {
+        return report_tool_violation(format!(
+            "{context} uses undeclared host tool path `{}`",
+            program.display()
+        ));
+    }
+
+    Ok(())
+}
+
+fn report_tool_violation(message: String) -> std::io::Result<()> {
+    if strict_tools_enabled() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("strict tools violation: {message}"),
+        ));
+    }
+
+    let warnings = TOOL_WARNINGS.get_or_init(|| Mutex::new(HashSet::new()));
+    if warnings
+        .lock()
+        .expect("tool warning lock poisoned")
+        .insert(message.clone())
+    {
+        eprintln!("[cbs] warning: non-hermetic tool use: {message}");
+    }
+    Ok(())
+}
+
+fn is_known_host_tool_path(program: &Path) -> bool {
+    ["/usr/bin", "/bin", "/usr/local/bin"]
+        .iter()
+        .map(Path::new)
+        .any(|dir| program.starts_with(dir))
+}
+
 struct NativeStaticLib {
     name: String,
     sources: Vec<String>,
@@ -567,6 +693,7 @@ struct NativeStaticLibOutput {
 fn build_native_static_libs(
     config: &Config,
     working_directory: &Path,
+    tool_paths: &HashMap<String, String>,
 ) -> std::io::Result<Vec<NativeStaticLibOutput>> {
     let crate_root = match config.get(config_extra_keys::CRATE_ROOT).first() {
         Some(root) => PathBuf::from(root),
@@ -599,7 +726,8 @@ fn build_native_static_libs(
                     args.push(crate_root.join(include_dir).to_string_lossy().to_string());
                 }
                 args.extend(lib.flags.iter().cloned());
-                run_process(Path::new("cc"), &args, &[]).map_err(std::io::Error::other)?;
+                run_process(Path::new("cc"), &args, &[], working_directory, tool_paths)
+                    .map_err(std::io::Error::other)?;
                 objects.push(object_path);
             }
 
@@ -613,7 +741,8 @@ fn build_native_static_libs(
                     .iter()
                     .map(|object| object.to_string_lossy().to_string()),
             );
-            run_process(Path::new("ar"), &args, &[]).map_err(std::io::Error::other)?;
+            run_process(Path::new("ar"), &args, &[], working_directory, tool_paths)
+                .map_err(std::io::Error::other)?;
 
             Ok(NativeStaticLibOutput {
                 name: lib.name,
