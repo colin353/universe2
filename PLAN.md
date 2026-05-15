@@ -199,17 +199,21 @@ Ordering note: do this before the full Phase 6 plugin split, but avoid cementing
   4. rebuild under strict tool mode.
 - Ensure CBS can still build itself without relying on undeclared host tools.
 
+Status: second slice implemented. `WORKSPACE.ccl` now declares the Rust plugin explicitly at `/tmp/rust.cdylib` with `parameters = { rust_version = "1.91.1" }`, and no longer has top-level `tools`, `toolchain`, or `platform_requirements` sections. The unused `//util/cbs:cbs.ccl` tool-definition file was removed. CBS no longer injects an implicit Rust workspace plugin, production `//util/cbs:cbs` no longer includes the duplicate Rust/Cargo plugin sources, and plugin initialization now receives parameters plus target/cache context and returns tool requirements. The Rust plugin now owns the temporary bootstrap Rust toolchain mapping for supported hosts (`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`) and declares `rustc`/`cargo`; on macOS it also declares Xcode `cc`, `ar`, `xcrun`, and fingerprints the developer dir / SDK. Actual Rust dist download/extraction and removing stale `rust_toolchain` support from CBS core remain future work.
+
 ## Open questions
 
 1. What is the bootstrap trust root for downloading toolchains: built-in HTTP client, declared host downloader, or pre-seeded cache?
 2. What archive/decompression implementation should CBS use for Rust dist tarballs without reintroducing host `tar`?
-3. Should plugin-provided tools be target labels, external requirements, or a third dependency class?
-4. Should plugin parameters be untyped CCL values passed through to plugins, or should CBS ask each plugin for a schema and validate parameters before initialization?
+3. Should plugin-provided tools eventually become target labels/external requirements rather than initialization-time tool records?
+4. Should plugin parameters remain string-only for now, or should CBS pass richer CCL values and ask each plugin for a schema before initialization?
 5. Do we want remote/cache portability guarantees, or only local reproducibility at first?
 6. Should strict mode reject all absolute paths, or allow declared immutable prefixes?
 7. What Linux-native `cc`/`ar` replacement should pair with the macOS Xcode compromise?
 
 ## Immediate next steps
 
-1. Make native recipes use exact declared `cc`/`ar` requirements per platform; on macOS this currently means the declared Xcode/SDK prerequisite, while Linux should move toward a downloaded LLVM/Zig-style toolchain.
-2. Start Phase 6 by adding plugin parameters and a plugin initialization/tool-requirement API, then move Rust-specific toolchain declarations out of CBS core.
+1. Move the Rust plugin artifact path out of `/tmp` into a CBS-managed install/cache location.
+2. Remove the stale `rust_toolchain` / `xcode_tool` WORKSPACE schema support from CBS core.
+3. Replace the temporary rustup/current-sysroot provider with Rust plugin-owned download/cache/extract logic for pinned Rust distributions.
+4. Decide the Linux-native `cc`/`ar` replacement that should pair with the macOS Xcode compromise.

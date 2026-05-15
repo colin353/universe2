@@ -36,6 +36,8 @@ pub enum BuildConfigKey {
     TargetArch,
     TargetVendor,
     TargetEndian,
+    MacosDeveloperDir,
+    MacosSdkPath,
 }
 
 #[derive(Debug, Clone)]

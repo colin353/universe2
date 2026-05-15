@@ -1,12 +1,6 @@
 use std::collections::HashMap;
 
-use cbs_plugin_sdk::{
-    config_extra_keys, decode_build_request, decode_parse_rule_request, encode_build_response,
-    encode_parse_rule_response, encode_plan_dependencies_response, encode_plugin_manifest,
-    encode_resolve_target_response, free_owned_buffer, BuildRequest, BuildResponse, CbsOwnedBuffer,
-    CbsPluginV1, CbsSlice, Config, ExternalRequirement, ParseRuleRequest, ParseRuleResponse,
-    PlanDependenciesResponse, PluginManifest, ResolveTargetResponse, CBS_PLUGIN_ABI_VERSION,
-};
+use cbs_plugin_sdk::*;
 
 const RUST_LIBRARY: &str = "rust_library";
 const RUST_BUS_LIBRARY: &str = "rust_bus_library";
@@ -16,6 +10,7 @@ pub extern "C" fn cbs_plugin_v1() -> CbsPluginV1 {
     CbsPluginV1 {
         abi_version: CBS_PLUGIN_ABI_VERSION,
         manifest: bus_manifest,
+        initialize: empty_plugin_initialize,
         parse_rule: bus_parse_rule,
         build: bus_build,
         plan_dependencies: bus_plan_dependencies,

@@ -5,9 +5,6 @@ cbs = rust_binary {
     root_source = "main.rs"
     srcs = [
         "actions.rs",
-        "bus.rs",
-        "cargo.rs",
-        "cargo_recipes.rs",
         "config_file.rs",
         "context.rs",
         "core.rs",
@@ -15,7 +12,6 @@ cbs = rust_binary {
         "main.rs",
         "plugin_abi.rs",
         "plugins.rs",
-        "rust_plugin.rs",
         "tool_diagnostics.rs",
         "workspace.rs",
     ]

@@ -271,10 +271,16 @@ impl BuildPlugin for AbiBuildPlugin {
             .iter()
             .map(|(name, tool)| (name.clone(), tool.path.to_string_lossy().to_string()))
             .collect();
+        let target_config: HashMap<u32, String> = context
+            .config
+            .iter()
+            .map(|(key, value)| (build_config_key_to_sdk(*key), value.clone()))
+            .collect();
         let request = sdk::encode_build_request_parts(
             &task.target,
             &config_to_sdk(config),
             &dependencies,
+            &target_config,
             &working_directory,
             &tool_paths,
         );
@@ -365,6 +371,17 @@ fn read_plugin_manifest(plugin: sdk::CbsPluginV1) -> std::io::Result<sdk::Plugin
     let buffer = (plugin.manifest)();
     let bytes = owned_buffer_bytes(buffer, plugin.free_buffer);
     sdk::decode_plugin_manifest(&bytes)
+}
+
+pub fn initialize_plugin(
+    plugin: sdk::CbsPluginV1,
+    request: &sdk::PluginInitRequest,
+) -> std::io::Result<sdk::PluginInitResponse> {
+    validate_abi(plugin)?;
+    let request = sdk::encode_plugin_init_request(request);
+    let buffer = (plugin.initialize)(sdk::CbsSlice::from_slice(&request));
+    let bytes = owned_buffer_bytes(buffer, plugin.free_buffer);
+    sdk::decode_plugin_init_response(&bytes)
 }
 
 fn validate_abi(plugin: sdk::CbsPluginV1) -> std::io::Result<()> {
@@ -519,7 +536,7 @@ fn plugin_context_to_sdk(context: &Context) -> sdk::PluginContext {
     }
 }
 
-fn build_config_key_to_sdk(key: BuildConfigKey) -> u32 {
+pub(crate) fn build_config_key_to_sdk(key: BuildConfigKey) -> u32 {
     match key {
         BuildConfigKey::TargetFamily => sdk::build_config_key::TARGET_FAMILY,
         BuildConfigKey::TargetEnv => sdk::build_config_key::TARGET_ENV,
@@ -527,5 +544,7 @@ fn build_config_key_to_sdk(key: BuildConfigKey) -> u32 {
         BuildConfigKey::TargetArch => sdk::build_config_key::TARGET_ARCH,
         BuildConfigKey::TargetVendor => sdk::build_config_key::TARGET_VENDOR,
         BuildConfigKey::TargetEndian => sdk::build_config_key::TARGET_ENDIAN,
+        BuildConfigKey::MacosDeveloperDir => sdk::build_config_key::MACOS_DEVELOPER_DIR,
+        BuildConfigKey::MacosSdkPath => sdk::build_config_key::MACOS_SDK_PATH,
     }
 }

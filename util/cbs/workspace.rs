@@ -11,7 +11,8 @@ use crate::core::{
 };
 use crate::exec::Executor;
 use crate::plugin_abi::{
-    load_dynamic_plugin, AbiDependencyPlanner, AbiResolverPlugin, AbiRulePlugin, LoadedAbiPlugin,
+    build_config_key_to_sdk, initialize_plugin, load_dynamic_plugin, AbiDependencyPlanner,
+    AbiResolverPlugin, AbiRulePlugin, LoadedAbiPlugin,
 };
 
 #[cfg(test)]
@@ -52,6 +53,7 @@ struct WorkspaceToolConfig {
 struct WorkspacePluginConfig {
     name: String,
     path: PathBuf,
+    parameters: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -279,55 +281,36 @@ impl Workspace {
     }
 
     fn load_workspace_plugins(&self) -> std::io::Result<Vec<LoadedWorkspacePlugin>> {
-        let mut plugins = vec![self.load_implicit_rust_plugin()?];
-        plugins.extend(
-            self.config
-                .plugins
-                .iter()
-                .map(|plugin| {
-                    let loaded = load_workspace_dynamic_or_test_plugin(&plugin.path, &plugin.name)
-                        .map_err(|e| {
-                            std::io::Error::new(
-                                e.kind(),
-                                format!(
-                                    "failed to load workspace plugin {} at {}: {e}",
-                                    plugin.name,
-                                    plugin.path.display()
-                                ),
-                            )
-                        })?;
-                    if loaded.manifest.name != plugin.name {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
+        self.config
+            .plugins
+            .iter()
+            .map(|plugin| {
+                let loaded = load_workspace_dynamic_or_test_plugin(&plugin.path, &plugin.name)
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
                             format!(
-                                "workspace plugin {} loaded manifest for {}",
-                                plugin.name, loaded.manifest.name
+                                "failed to load workspace plugin {} at {}: {e}",
+                                plugin.name,
+                                plugin.path.display()
                             ),
-                        ));
-                    }
-                    Ok(LoadedWorkspacePlugin {
-                        path: plugin.path.clone(),
-                        loaded,
-                    })
+                        )
+                    })?;
+                if loaded.manifest.name != plugin.name {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "workspace plugin {} loaded manifest for {}",
+                            plugin.name, loaded.manifest.name
+                        ),
+                    ));
+                }
+                Ok(LoadedWorkspacePlugin {
+                    path: plugin.path.clone(),
+                    loaded,
                 })
-                .collect::<std::io::Result<Vec<_>>>()?,
-        );
-        Ok(plugins)
-    }
-
-    fn load_implicit_rust_plugin(&self) -> std::io::Result<LoadedWorkspacePlugin> {
-        let path = PathBuf::from("/tmp/rust.cdylib");
-        let loaded = load_workspace_dynamic_or_test_plugin(&path, "rust")?;
-        if loaded.manifest.name != "rust" {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "rust plugin path loaded manifest for {}",
-                    loaded.manifest.name
-                ),
-            ));
-        }
-        Ok(LoadedWorkspacePlugin { path, loaded })
+            })
+            .collect()
     }
 }
 
@@ -712,8 +695,22 @@ fn target_tables<'a>(
 
 fn load_workspace_config(root: &Path, workspace_file: &Path) -> std::io::Result<WorkspaceConfig> {
     let table = load_workspace_table(root, workspace_file)?;
-    let tools = workspace_tools(root, &table)?;
-    let platform_fingerprints = platform_requirement_fingerprints(root, &table)?;
+    let cache_dir = table
+        .get("workspace")
+        .and_then(|value| value.as_table())
+        .and_then(|workspace| workspace.get("cache_dir"))
+        .and_then(|value| value.as_str())
+        .map(|cache_dir| root.join(cache_dir))
+        .unwrap_or_else(|| root.join(".cbs").join("cache"));
+    let target_config = target_config(&table);
+    let plugins = workspace_plugins(root, &table)?;
+    let mut tools = workspace_tools(root, &table)?;
+    let mut platform_fingerprints = platform_requirement_fingerprints(root, &table)?;
+    let plugin_init = plugin_workspace_tools(root, &cache_dir, &target_config, &plugins)?;
+    for tool in plugin_init.tools {
+        insert_workspace_tool(&mut tools, tool)?;
+    }
+    platform_fingerprints.extend(plugin_init.fingerprints);
     let rustc_ref = table
         .get("toolchain")
         .and_then(|value| value.as_table())
@@ -725,21 +722,83 @@ fn load_workspace_config(root: &Path, workspace_file: &Path) -> std::io::Result<
         .or_else(|| std::env::var("RUSTC").ok())
         .unwrap_or_else(|| "rustc".to_string());
     let rustc = resolve_tool_or_path(root, &tools, &rustc_ref);
-    let cache_dir = table
-        .get("workspace")
-        .and_then(|value| value.as_table())
-        .and_then(|workspace| workspace.get("cache_dir"))
-        .and_then(|value| value.as_str())
-        .map(|cache_dir| root.join(cache_dir))
-        .unwrap_or_else(|| root.join(".cbs").join("cache"));
 
     Ok(WorkspaceConfig {
         cache_dir,
         rustc,
         tool_fingerprints: tool_fingerprints(&tools, platform_fingerprints),
         tools,
-        target_config: target_config(&table),
-        plugins: workspace_plugins(root, &table)?,
+        target_config,
+        plugins,
+    })
+}
+
+struct PluginWorkspaceTools {
+    tools: Vec<WorkspaceToolConfig>,
+    fingerprints: Vec<(String, String)>,
+}
+
+fn plugin_workspace_tools(
+    root: &Path,
+    cache_dir: &Path,
+    target_config: &[(BuildConfigKey, String)],
+    plugins: &[WorkspacePluginConfig],
+) -> std::io::Result<PluginWorkspaceTools> {
+    let mut tools = Vec::new();
+    let mut fingerprints = Vec::new();
+    let sdk_target_config: HashMap<u32, String> = target_config
+        .iter()
+        .map(|(key, value)| (build_config_key_to_sdk(*key), value.clone()))
+        .collect();
+    for plugin in plugins {
+        let loaded = load_workspace_dynamic_or_test_plugin(&plugin.path, &plugin.name).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to initialize workspace plugin {} at {}: {e}",
+                    plugin.name,
+                    plugin.path.display()
+                ),
+            )
+        })?;
+        if loaded.manifest.name != plugin.name {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "workspace plugin {} loaded manifest for {}",
+                    plugin.name, loaded.manifest.name
+                ),
+            ));
+        }
+        let request = cbs_plugin_sdk::PluginInitRequest {
+            name: plugin.name.clone(),
+            workspace_root: root.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+            target_config: sdk_target_config.clone(),
+            parameters: plugin.parameters.clone(),
+        };
+        match initialize_plugin(loaded.plugin, &request)? {
+            cbs_plugin_sdk::PluginInitResponse::Success(init) => {
+                tools.extend(init.tools.into_iter().map(|tool| WorkspaceToolConfig {
+                    name: tool.name,
+                    kind: tool.kind,
+                    path: tool.path,
+                    sha256: None,
+                    fingerprint: tool.fingerprint,
+                }));
+                fingerprints.extend(init.fingerprints);
+            }
+            cbs_plugin_sdk::PluginInitResponse::Failure(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("workspace plugin {} initialization failed: {error}", plugin.name),
+                ))
+            }
+        }
+    }
+    Ok(PluginWorkspaceTools {
+        tools,
+        fingerprints,
     })
 }
 
@@ -1415,7 +1474,32 @@ fn workspace_plugins(
             Ok(WorkspacePluginConfig {
                 name: required_string(plugin, "name")?,
                 path: root_relative_path(root, &required_string(plugin, "path")?),
+                parameters: plugin_parameters(plugin)?,
             })
+        })
+        .collect()
+}
+
+fn plugin_parameters(plugin: &ConfigTable) -> std::io::Result<HashMap<String, String>> {
+    let Some(parameters) = plugin.get("parameters") else {
+        return Ok(HashMap::new());
+    };
+    let parameters = parameters.as_table().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "plugin parameters must be a table",
+        )
+    })?;
+    parameters
+        .iter()
+        .map(|(key, value)| {
+            let value = value.as_str().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("plugin parameter {key} must be a string"),
+                )
+            })?;
+            Ok((key.clone(), value.to_string()))
         })
         .collect()
 }
@@ -1500,14 +1584,27 @@ fn target_config(table: &ConfigTable) -> Vec<(BuildConfigKey, String)> {
             "big"
         });
 
-    vec![
+    let mut config = vec![
         (BuildConfigKey::TargetFamily, family.to_string()),
         (BuildConfigKey::TargetOS, os.to_string()),
         (BuildConfigKey::TargetEnv, env.to_string()),
         (BuildConfigKey::TargetArch, arch.to_string()),
         (BuildConfigKey::TargetVendor, vendor.to_string()),
         (BuildConfigKey::TargetEndian, endian.to_string()),
-    ]
+    ];
+    if os == "macos" {
+        config.extend([
+            (
+                BuildConfigKey::MacosDeveloperDir,
+                detect_xcode_developer_dir().to_string_lossy().to_string(),
+            ),
+            (
+                BuildConfigKey::MacosSdkPath,
+                detect_macos_sdk_path().to_string_lossy().to_string(),
+            ),
+        ]);
+    }
+    config
 }
 
 fn parse_label_or_external(value: &str, current_package: &str) -> std::io::Result<String> {

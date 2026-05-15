@@ -1,19 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use sha2::Digest;
+
 #[path = "cargo.rs"]
 mod cargo;
 #[path = "cargo_recipes.rs"]
 mod cargo_recipes;
 
-use cbs_plugin_sdk::{
-    build_output_kind, config_extra_keys, decode_build_request, decode_parse_rule_request,
-    decode_plan_dependencies_request, decode_resolve_target_request, encode_build_response,
-    encode_parse_rule_response, encode_plan_dependencies_response, encode_plugin_manifest,
-    encode_resolve_target_response, free_owned_buffer, BuildOutput, BuildRequest, BuildResponse,
-    CbsOwnedBuffer, CbsPluginV1, CbsSlice, Config, ParseRuleRequest, ParseRuleResponse,
-    PlanDependenciesResponse, PluginManifest, ResolveTargetResponse, CBS_PLUGIN_ABI_VERSION,
-};
+use cbs_plugin_sdk::*;
 
 const RUST_LIBRARY: &str = "rust_library";
 const RUST_BINARY: &str = "rust_binary";
@@ -24,6 +19,7 @@ pub extern "C" fn cbs_plugin_v1() -> CbsPluginV1 {
     CbsPluginV1 {
         abi_version: CBS_PLUGIN_ABI_VERSION,
         manifest: rust_manifest,
+        initialize: rust_initialize,
         parse_rule: rust_parse_rule,
         build: rust_build,
         plan_dependencies: rust_plan_dependencies,
@@ -46,6 +42,302 @@ extern "C" fn rust_manifest() -> CbsOwnedBuffer {
         dependency_ecosystems: vec!["cargo".to_string()],
         target_prefixes: vec!["cargo://".to_string()],
     }))
+}
+
+extern "C" fn rust_initialize(request: CbsSlice) -> CbsOwnedBuffer {
+    let response = match decode_plugin_init_request(unsafe { request.as_slice() }) {
+        Ok(request) => initialize_rust_plugin(request)
+            .map(|init| PluginInitResponse::Success(init))
+            .unwrap_or_else(|e| PluginInitResponse::Failure(e.to_string())),
+        Err(e) => PluginInitResponse::Failure(format!("failed to decode init request: {e}")),
+    };
+    CbsOwnedBuffer::from_vec(encode_plugin_init_response(&response))
+}
+
+fn initialize_rust_plugin(request: PluginInitRequest) -> std::io::Result<PluginInit> {
+    let rust_version = request
+        .parameters
+        .get("rust_version")
+        .map(String::as_str)
+        .unwrap_or("1.91.1");
+    let host = current_rust_host_triple();
+    let dist_sha256 = rust_dist_sha256(rust_version, &host)?;
+    let sysroot = rustup_sysroot()?;
+    let rustc = sysroot.join("bin").join(executable_name("rustc"));
+    let cargo = sysroot.join("bin").join(executable_name("cargo"));
+    validate_rust_toolchain(rust_version, &host, &rustc)?;
+    if !cargo.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Rust toolchain does not contain cargo at {}", cargo.display()),
+        ));
+    }
+    let metadata =
+        format!("rust-toolchain:version={rust_version}:host={host}:dist-sha256={dist_sha256}");
+    let mut tools = vec![
+        tool_requirement("rustc", "rust_toolchain", &rustc, &metadata)?,
+        tool_requirement("cargo", "rust_toolchain", &cargo, &metadata)?,
+    ];
+    let mut fingerprints = Vec::new();
+
+    if request
+        .target_config
+        .get(&build_config_key::TARGET_OS)
+        .is_some_and(|os| os == "macos")
+    {
+        let developer_dir = request
+            .target_config
+            .get(&build_config_key::MACOS_DEVELOPER_DIR)
+            .map(PathBuf::from)
+            .unwrap_or_else(detect_xcode_developer_dir);
+        let sdk_path = request
+            .target_config
+            .get(&build_config_key::MACOS_SDK_PATH)
+            .map(PathBuf::from)
+            .unwrap_or_else(detect_macos_sdk_path);
+        tools.push(tool_requirement(
+            "cc",
+            "xcode_tool",
+            &xcrun_find("cc")?,
+            "xcode-tool",
+        )?);
+        tools.push(tool_requirement(
+            "ar",
+            "xcode_tool",
+            &xcrun_find("ar")?,
+            "xcode-tool",
+        )?);
+        tools.push(tool_requirement(
+            "xcrun",
+            "xcode_tool",
+            Path::new("/usr/bin/xcrun"),
+            "xcode-tool",
+        )?);
+        fingerprints.push((
+            "platform_requirement:macos:xcode".to_string(),
+            macos_xcode_fingerprint("xcode", &developer_dir, &sdk_path)?,
+        ));
+    }
+
+    Ok(PluginInit {
+        tools,
+        fingerprints,
+    })
+}
+
+fn rust_dist_sha256(version: &str, host: &str) -> std::io::Result<&'static str> {
+    match (version, host) {
+        ("1.91.1", "aarch64-apple-darwin") => {
+            Ok("f6727c9ab64a5b2a15623f29a023faf0c6a6aeb1347d102b88d595e5c1d9beae")
+        }
+        ("1.91.1", "x86_64-unknown-linux-gnu") => {
+            Ok("1c955c040dd087e4751d15588ddec288b4208bea16f8ec5046c164877e55fff7")
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Rust plugin has no Rust dist metadata for version {version:?} host {host:?}"),
+        )),
+    }
+}
+
+fn current_rust_host_triple() -> String {
+    let arch = std::env::consts::ARCH;
+    match std::env::consts::OS {
+        "macos" => format!("{arch}-apple-darwin"),
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        "windows" => format!("{arch}-pc-windows-msvc"),
+        os => format!("{arch}-unknown-{os}"),
+    }
+}
+
+fn executable_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
+}
+
+fn rustup_sysroot() -> std::io::Result<PathBuf> {
+    let output = std::process::Command::new("rustc")
+        .arg("--print")
+        .arg("sysroot")
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "rustc --print sysroot failed",
+        ));
+    }
+    let sysroot = String::from_utf8(output.stdout)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(PathBuf::from(sysroot.trim()))
+}
+
+fn validate_rust_toolchain(version: &str, host: &str, rustc: &Path) -> std::io::Result<()> {
+    let output = std::process::Command::new(rustc).arg("-Vv").output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to run {} -Vv", rustc.display()),
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let release = rustc_version_field(&stdout, "release").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} -Vv output did not include a release", rustc.display()),
+        )
+    })?;
+    if release != version {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Rust plugin expected Rust {version}, found {release}"),
+        ));
+    }
+    let actual_host = rustc_version_field(&stdout, "host").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} -Vv output did not include a host", rustc.display()),
+        )
+    })?;
+    if actual_host != host {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Rust plugin expected host {host}, found {actual_host}"),
+        ));
+    }
+    Ok(())
+}
+
+fn rustc_version_field<'a>(output: &'a str, field: &str) -> Option<&'a str> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(field)?.strip_prefix(": "))
+}
+
+fn tool_requirement(
+    name: &str,
+    kind: &str,
+    path: &Path,
+    metadata: &str,
+) -> std::io::Result<ToolRequirement> {
+    if !path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("tool {name:?} not found at {}", path.display()),
+        ));
+    }
+    let sha = file_sha256(path)?;
+    Ok(ToolRequirement {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        path: path.to_path_buf(),
+        fingerprint: format!("{kind}:path={}:sha256={sha};{metadata}", path.display()),
+    })
+}
+
+fn detect_xcode_developer_dir() -> PathBuf {
+    command_output_path("/usr/bin/xcode-select", &["-p"]).unwrap_or_else(|| {
+        PathBuf::from("/Applications/Xcode.app")
+            .join("Contents")
+            .join("Developer")
+    })
+}
+
+fn detect_macos_sdk_path() -> PathBuf {
+    command_output_path("/usr/bin/xcrun", &["--show-sdk-path"]).unwrap_or_else(|| {
+        PathBuf::from("/Library")
+            .join("Developer")
+            .join("CommandLineTools")
+            .join("SDKs")
+            .join("MacOSX.sdk")
+    })
+}
+
+fn xcrun_find(tool: &str) -> std::io::Result<PathBuf> {
+    command_output_path("/usr/bin/xcrun", &["--find", tool]).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("xcrun could not find {tool}"),
+        )
+    })
+}
+
+fn command_output_path(program: &str, args: &[&str]) -> Option<PathBuf> {
+    let output = std::process::Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let path = stdout.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+fn macos_xcode_fingerprint(
+    name: &str,
+    developer_dir: &Path,
+    sdk_path: &Path,
+) -> std::io::Result<String> {
+    if !developer_dir.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "macOS Xcode requirement {name} is missing developer_dir {}. Install Xcode or Command Line Tools.",
+                developer_dir.display()
+            ),
+        ));
+    }
+    if !sdk_path.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "macOS Xcode requirement {name} is missing sdk_path {}. Install the macOS SDK.",
+                sdk_path.display()
+            ),
+        ));
+    }
+    let clang = developer_dir
+        .join("Toolchains")
+        .join("XcodeDefault.xctoolchain")
+        .join("usr")
+        .join("bin")
+        .join("clang");
+    if !clang.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "macOS Xcode requirement {name} is missing clang at {}",
+                clang.display()
+            ),
+        ));
+    }
+    let target_conditionals = sdk_path.join("usr").join("include").join("TargetConditionals.h");
+    if !target_conditionals.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "macOS Xcode requirement {name} is missing SDK header {}",
+                target_conditionals.display()
+            ),
+        ));
+    }
+    let target_conditionals_sha = file_sha256(&target_conditionals)?;
+    Ok(format!(
+        "macos_xcode:developer_dir={}:sdk_path={}:TargetConditionals.h={target_conditionals_sha}",
+        developer_dir.to_string_lossy(),
+        sdk_path.to_string_lossy()
+    ))
+}
+
+fn file_sha256(path: &Path) -> std::io::Result<String> {
+    let data = std::fs::read(path)?;
+    let digest = sha2::Sha256::digest(&data);
+    Ok(format!("{digest:x}"))
 }
 
 extern "C" fn rust_parse_rule(request: CbsSlice) -> CbsOwnedBuffer {
@@ -155,12 +447,14 @@ fn build_rust_request(request: BuildRequest) -> BuildResponse {
     let name = rust_name(&request.target);
     let config = request.config;
     let tool_paths = request.tool_paths;
+    let target_config = request.target_config;
     match config.kind.as_str() {
         RUST_LIBRARY => build_library(
             &request.working_directory,
             &name,
             config,
             request.dependencies,
+            &target_config,
             &tool_paths,
         ),
         RUST_BINARY => build_executable(
@@ -169,6 +463,7 @@ fn build_rust_request(request: BuildRequest) -> BuildResponse {
             config,
             request.dependencies,
             false,
+            &target_config,
             &tool_paths,
         ),
         RUST_TEST => build_executable(
@@ -177,6 +472,7 @@ fn build_rust_request(request: BuildRequest) -> BuildResponse {
             config,
             request.dependencies,
             true,
+            &target_config,
             &tool_paths,
         ),
         kind => BuildResponse::Failure(format!("unsupported target kind: {kind:?}")),
@@ -188,6 +484,7 @@ fn build_library(
     name: &str,
     config: Config,
     deps: HashMap<String, BuildOutput>,
+    target_config: &HashMap<u32, String>,
     tool_paths: &HashMap<String, String>,
 ) -> BuildResponse {
     let compiler = match compiler(&config, &deps) {
@@ -220,13 +517,18 @@ fn build_library(
         Ok(root_source) => root_source,
         Err(e) => return BuildResponse::Failure(e),
     };
-    let native_libs = match build_native_static_libs(&config, working_directory, tool_paths) {
+    let native_libs = match build_native_static_libs(
+        &config,
+        working_directory,
+        target_config,
+        tool_paths,
+    ) {
         Ok(libs) => libs,
         Err(e) => {
             return BuildResponse::Failure(format!("failed to build native static libs: {e:?}"))
         }
     };
-    let rustc_env = rustc_env(&config);
+    let rustc_env = command_env(&config, target_config);
     let mut args = common_rustc_args(&config, &deps);
     args.push(root_source);
     args.extend(native_link_args(&native_libs));
@@ -275,6 +577,7 @@ fn build_executable(
     config: Config,
     deps: HashMap<String, BuildOutput>,
     test: bool,
+    target_config: &HashMap<u32, String>,
     tool_paths: &HashMap<String, String>,
 ) -> BuildResponse {
     let compiler = match compiler(&config, &deps) {
@@ -294,7 +597,7 @@ fn build_executable(
         Ok(root_source) => root_source,
         Err(e) => return BuildResponse::Failure(e),
     };
-    let rustc_env = rustc_env(&config);
+    let rustc_env = command_env(&config, target_config);
     let mut args = common_rustc_args(&config, &deps);
     args.push(root_source);
     if test {
@@ -503,6 +806,23 @@ fn rustc_env(config: &Config) -> Vec<(String, String)> {
         .collect()
 }
 
+fn command_env(config: &Config, target_config: &HashMap<u32, String>) -> Vec<(String, String)> {
+    let mut env = rustc_env(config);
+    env.extend(platform_env(target_config));
+    env
+}
+
+fn platform_env(target_config: &HashMap<u32, String>) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if let Some(developer_dir) = target_config.get(&build_config_key::MACOS_DEVELOPER_DIR) {
+        env.push(("DEVELOPER_DIR".to_string(), developer_dir.clone()));
+    }
+    if let Some(sdk_root) = target_config.get(&build_config_key::MACOS_SDK_PATH) {
+        env.push(("SDKROOT".to_string(), sdk_root.clone()));
+    }
+    env
+}
+
 fn library_output_file(
     working_directory: &Path,
     crate_name: &str,
@@ -674,6 +994,7 @@ struct NativeStaticLibOutput {
 fn build_native_static_libs(
     config: &Config,
     working_directory: &Path,
+    target_config: &HashMap<u32, String>,
     tool_paths: &HashMap<String, String>,
 ) -> std::io::Result<Vec<NativeStaticLibOutput>> {
     let crate_root = match config.get(config_extra_keys::CRATE_ROOT).first() {
@@ -707,7 +1028,8 @@ fn build_native_static_libs(
                     args.push(crate_root.join(include_dir).to_string_lossy().to_string());
                 }
                 args.extend(lib.flags.iter().cloned());
-                run_process(Path::new("cc"), &args, &[], working_directory, tool_paths)
+                let env = platform_env(target_config);
+                run_process(Path::new("cc"), &args, &env, working_directory, tool_paths)
                     .map_err(std::io::Error::other)?;
                 objects.push(object_path);
             }
@@ -722,7 +1044,8 @@ fn build_native_static_libs(
                     .iter()
                     .map(|object| object.to_string_lossy().to_string()),
             );
-            run_process(Path::new("ar"), &args, &[], working_directory, tool_paths)
+            let env = platform_env(target_config);
+            run_process(Path::new("ar"), &args, &env, working_directory, tool_paths)
                 .map_err(std::io::Error::other)?;
 
             Ok(NativeStaticLibOutput {

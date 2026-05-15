@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-pub const CBS_PLUGIN_ABI_VERSION: u32 = 1;
+pub const CBS_PLUGIN_ABI_VERSION: u32 = 2;
 
 pub mod config_extra_keys {
     pub const FEATURES: u32 = 0;
@@ -29,6 +29,8 @@ pub mod build_config_key {
     pub const TARGET_ARCH: u32 = 4;
     pub const TARGET_VENDOR: u32 = 5;
     pub const TARGET_ENDIAN: u32 = 6;
+    pub const MACOS_DEVELOPER_DIR: u32 = 7;
+    pub const MACOS_SDK_PATH: u32 = 8;
 }
 
 #[repr(C)]
@@ -80,6 +82,7 @@ impl CbsOwnedBuffer {
 pub struct CbsPluginV1 {
     pub abi_version: u32,
     pub manifest: extern "C" fn() -> CbsOwnedBuffer,
+    pub initialize: extern "C" fn(CbsSlice) -> CbsOwnedBuffer,
     pub parse_rule: extern "C" fn(CbsSlice) -> CbsOwnedBuffer,
     pub build: extern "C" fn(CbsSlice) -> CbsOwnedBuffer,
     pub plan_dependencies: extern "C" fn(CbsSlice) -> CbsOwnedBuffer,
@@ -94,6 +97,15 @@ pub extern "C" fn free_owned_buffer(buffer: CbsOwnedBuffer) {
     unsafe {
         drop(buffer.into_vec());
     }
+}
+
+pub extern "C" fn empty_plugin_initialize(_request: CbsSlice) -> CbsOwnedBuffer {
+    CbsOwnedBuffer::from_vec(encode_plugin_init_response(&PluginInitResponse::Success(
+        PluginInit {
+            tools: Vec::new(),
+            fingerprints: Vec::new(),
+        },
+    )))
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -143,6 +155,7 @@ pub struct BuildRequest {
     pub target: String,
     pub config: Config,
     pub dependencies: HashMap<String, BuildOutput>,
+    pub target_config: HashMap<u32, String>,
     pub working_directory: PathBuf,
     pub tool_paths: HashMap<String, String>,
 }
@@ -499,6 +512,35 @@ pub struct PluginManifest {
     pub target_prefixes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginInitRequest {
+    pub name: String,
+    pub workspace_root: PathBuf,
+    pub cache_dir: PathBuf,
+    pub target_config: HashMap<u32, String>,
+    pub parameters: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginInit {
+    pub tools: Vec<ToolRequirement>,
+    pub fingerprints: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRequirement {
+    pub name: String,
+    pub kind: String,
+    pub path: PathBuf,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginInitResponse {
+    Success(PluginInit),
+    Failure(String),
+}
+
 pub fn encode_config(config: &Config) -> Vec<u8> {
     let mut fbb = flatbuffers::FlatBufferBuilder::new();
     let root = fb::create_config(&mut fbb, config);
@@ -528,6 +570,7 @@ pub fn encode_build_request(request: &BuildRequest) -> Vec<u8> {
         &request.target,
         &request.config,
         &request.dependencies,
+        &request.target_config,
         &request.working_directory,
         &request.tool_paths,
     )
@@ -537,6 +580,7 @@ pub fn encode_build_request_parts(
     target: &str,
     config: &Config,
     dependencies: &HashMap<String, BuildOutput>,
+    target_config: &HashMap<u32, String>,
     working_directory: &Path,
     tool_paths: &HashMap<String, String>,
 ) -> Vec<u8> {
@@ -546,6 +590,7 @@ pub fn encode_build_request_parts(
         target,
         config,
         dependencies,
+        target_config,
         working_directory,
         tool_paths,
     );
@@ -662,6 +707,185 @@ pub fn read_plugin_manifest(plugin: CbsPluginV1) -> std::io::Result<PluginManife
     let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len).to_vec() };
     (plugin.free_buffer)(buffer);
     decode_plugin_manifest(&bytes)
+}
+
+pub fn encode_plugin_init_request(request: &PluginInitRequest) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    write_string(&mut bytes, &request.name);
+    write_string(&mut bytes, &request.workspace_root.display().to_string());
+    write_string(&mut bytes, &request.cache_dir.display().to_string());
+    write_u32(&mut bytes, request.target_config.len() as u32);
+    for (key, value) in &request.target_config {
+        write_u32(&mut bytes, *key);
+        write_string(&mut bytes, value);
+    }
+    write_u32(&mut bytes, request.parameters.len() as u32);
+    for (key, value) in &request.parameters {
+        write_string(&mut bytes, key);
+        write_string(&mut bytes, value);
+    }
+    bytes
+}
+
+pub fn decode_plugin_init_request(bytes: &[u8]) -> std::io::Result<PluginInitRequest> {
+    let mut reader = BinaryReader { bytes, position: 0 };
+    let name = reader.read_string()?;
+    let workspace_root = PathBuf::from(reader.read_string()?);
+    let cache_dir = PathBuf::from(reader.read_string()?);
+    let target_config = reader.read_u32_string_map()?;
+    let parameters = reader.read_string_map()?;
+    reader.finish()?;
+    Ok(PluginInitRequest {
+        name,
+        workspace_root,
+        cache_dir,
+        target_config,
+        parameters,
+    })
+}
+
+pub fn encode_plugin_init_response(response: &PluginInitResponse) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    match response {
+        PluginInitResponse::Success(init) => {
+            bytes.push(1);
+            write_u32(&mut bytes, init.tools.len() as u32);
+            for tool in &init.tools {
+                write_string(&mut bytes, &tool.name);
+                write_string(&mut bytes, &tool.kind);
+                write_string(&mut bytes, &tool.path.display().to_string());
+                write_string(&mut bytes, &tool.fingerprint);
+            }
+            write_u32(&mut bytes, init.fingerprints.len() as u32);
+            for (key, value) in &init.fingerprints {
+                write_string(&mut bytes, key);
+                write_string(&mut bytes, value);
+            }
+        }
+        PluginInitResponse::Failure(error) => {
+            bytes.push(0);
+            write_string(&mut bytes, error);
+        }
+    }
+    bytes
+}
+
+pub fn decode_plugin_init_response(bytes: &[u8]) -> std::io::Result<PluginInitResponse> {
+    let mut reader = BinaryReader { bytes, position: 0 };
+    let success = reader.read_byte()?;
+    let response = match success {
+        0 => PluginInitResponse::Failure(reader.read_string()?),
+        1 => {
+            let mut tools = Vec::new();
+            for _ in 0..reader.read_u32()? {
+                tools.push(ToolRequirement {
+                    name: reader.read_string()?,
+                    kind: reader.read_string()?,
+                    path: PathBuf::from(reader.read_string()?),
+                    fingerprint: reader.read_string()?,
+                });
+            }
+            let mut fingerprints = Vec::new();
+            for _ in 0..reader.read_u32()? {
+                fingerprints.push((reader.read_string()?, reader.read_string()?));
+            }
+            PluginInitResponse::Success(PluginInit {
+                tools,
+                fingerprints,
+            })
+        }
+        value => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid plugin init response tag {value}"),
+            ))
+        }
+    };
+    reader.finish()?;
+    Ok(response)
+}
+
+fn write_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend(value.to_le_bytes());
+}
+
+fn write_string(bytes: &mut Vec<u8>, value: &str) {
+    write_u32(bytes, value.len() as u32);
+    bytes.extend(value.as_bytes());
+}
+
+struct BinaryReader<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> BinaryReader<'a> {
+    fn read_byte(&mut self) -> std::io::Result<u8> {
+        if self.position >= self.bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected end of plugin init message",
+            ));
+        }
+        let value = self.bytes[self.position];
+        self.position += 1;
+        Ok(value)
+    }
+
+    fn read_u32(&mut self) -> std::io::Result<u32> {
+        if self.position + 4 > self.bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected end of plugin init message",
+            ));
+        }
+        let mut value = [0; 4];
+        value.copy_from_slice(&self.bytes[self.position..self.position + 4]);
+        self.position += 4;
+        Ok(u32::from_le_bytes(value))
+    }
+
+    fn read_string(&mut self) -> std::io::Result<String> {
+        let len = self.read_u32()? as usize;
+        if self.position + len > self.bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected end of plugin init string",
+            ));
+        }
+        let value = std::str::from_utf8(&self.bytes[self.position..self.position + len])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+            .to_string();
+        self.position += len;
+        Ok(value)
+    }
+
+    fn read_u32_string_map(&mut self) -> std::io::Result<HashMap<u32, String>> {
+        let mut values = HashMap::new();
+        for _ in 0..self.read_u32()? {
+            values.insert(self.read_u32()?, self.read_string()?);
+        }
+        Ok(values)
+    }
+
+    fn read_string_map(&mut self) -> std::io::Result<HashMap<String, String>> {
+        let mut values = HashMap::new();
+        for _ in 0..self.read_u32()? {
+            values.insert(self.read_string()?, self.read_string()?);
+        }
+        Ok(values)
+    }
+
+    fn finish(self) -> std::io::Result<()> {
+        if self.position == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "plugin init message has trailing bytes",
+            ))
+        }
+    }
 }
 
 mod fb {
@@ -896,6 +1120,7 @@ mod fb {
         const VT_DEPENDENCIES: VOffsetT = VT_FIRST + 4;
         const VT_WORKING_DIRECTORY: VOffsetT = VT_FIRST + 6;
         const VT_TOOL_PATHS: VOffsetT = VT_FIRST + 8;
+        const VT_TARGET_CONFIG: VOffsetT = VT_FIRST + 10;
     }
 
     impl<'a> BuildResponse<'a> {
@@ -1106,6 +1331,7 @@ mod fb {
             &request.target,
             &request.config,
             &request.dependencies,
+            &request.target_config,
             &request.working_directory,
             &request.tool_paths,
         )
@@ -1116,12 +1342,14 @@ mod fb {
         target: &str,
         config: &CoreConfig,
         dependencies: &HashMap<String, CoreBuildOutput>,
+        target_config: &HashMap<u32, String>,
         working_directory: &Path,
         tool_paths: &HashMap<String, String>,
     ) -> WIPOffset<BuildRequest<'a>> {
         let target = fbb.create_string(target);
         let config = create_config(fbb, config);
         let dependencies = create_dependency_output_vector(fbb, dependencies);
+        let target_config = create_target_config_vector(fbb, target_config);
         let working_directory = fbb.create_string(&working_directory.display().to_string());
         let tool_paths = create_string_field_vector(fbb, tool_paths);
 
@@ -1131,6 +1359,7 @@ mod fb {
         fbb.push_slot_always(BuildRequest::VT_DEPENDENCIES, dependencies);
         fbb.push_slot_always(BuildRequest::VT_WORKING_DIRECTORY, working_directory);
         fbb.push_slot_always(BuildRequest::VT_TOOL_PATHS, tool_paths);
+        fbb.push_slot_always(BuildRequest::VT_TARGET_CONFIG, target_config);
         finish_table(fbb, start)
     }
 
@@ -1162,6 +1391,14 @@ mod fb {
             target: string_slot(request.table, BuildRequest::VT_TARGET),
             config,
             dependencies,
+            target_config: read_target_config(unsafe {
+                request
+                    .table
+                    .get::<ForwardsUOffset<Vector<'_, ForwardsUOffset<Extra<'_>>>>>(
+                        BuildRequest::VT_TARGET_CONFIG,
+                        None,
+                    )
+            }),
             working_directory: PathBuf::from(string_slot(
                 request.table,
                 BuildRequest::VT_WORKING_DIRECTORY,
@@ -1957,6 +2194,9 @@ mod tests {
                 ..Default::default()
             },
             dependencies,
+            target_config: [(build_config_key::TARGET_OS, "macos".to_string())]
+                .into_iter()
+                .collect(),
             working_directory: PathBuf::from("/tmp/cbs/schema"),
             tool_paths: [("busfmt".to_string(), "/declared/busfmt".to_string())]
                 .into_iter()
