@@ -1,6 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 #[path = "cargo.rs"]
 mod cargo;
@@ -628,12 +627,6 @@ fn symlink_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::copy(src, dst).map(|_| ())
 }
 
-static TOOL_WARNINGS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-
-fn strict_tools_enabled() -> bool {
-    std::env::var_os("CBS_STRICT_TOOLS").is_some_and(|value| value != "0")
-}
-
 fn diagnose_command(program: &Path, context: &str) -> std::io::Result<()> {
     if program.components().count() == 1 {
         return report_tool_violation(format!(
@@ -653,22 +646,10 @@ fn diagnose_command(program: &Path, context: &str) -> std::io::Result<()> {
 }
 
 fn report_tool_violation(message: String) -> std::io::Result<()> {
-    if strict_tools_enabled() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("strict tools violation: {message}"),
-        ));
-    }
-
-    let warnings = TOOL_WARNINGS.get_or_init(|| Mutex::new(HashSet::new()));
-    if warnings
-        .lock()
-        .expect("tool warning lock poisoned")
-        .insert(message.clone())
-    {
-        eprintln!("[cbs] warning: non-hermetic tool use: {message}");
-    }
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("non-hermetic tool use rejected: {message}"),
+    ))
 }
 
 fn is_known_host_tool_path(program: &Path) -> bool {

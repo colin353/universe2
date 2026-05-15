@@ -136,10 +136,10 @@ Current direction:
 
 - Inventory every `Command::new`, `run_process`, and path lookup in CBS, plugins, and build actions.
 - Add warnings when CBS executes a bare command or searches host paths.
-- Add a `--strict-tools` flag that fails on undeclared command execution.
-- Keep default behavior compatible at first.
+- Reject undeclared command execution.
+- Do not provide compatibility escape hatches for non-hermetic tool use.
 
-Status: implemented diagnostics for CBS action execution, plugin SDK command resolution, and Rust plugin process execution. `--strict-tools` is available as a global CBS flag and currently fails on undeclared bare host tools/path searches.
+Status: implemented diagnostics for CBS action execution, plugin SDK command resolution, and Rust plugin process execution. Non-hermetic tool use is rejected unconditionally; the earlier `--strict-tools`, `--allow-non-hermetic-tools`, and environment-variable escape hatch were removed.
 
 ### Phase 2: Tool declarations and resolution
 
@@ -149,7 +149,7 @@ Status: implemented diagnostics for CBS action execution, plugin SDK command res
 - Add tool fingerprints to context/action hashes.
 - Convert `rustc` from `toolchain.rust.rustc = "rustc"` into a declared tool reference.
 
-Status: implemented `tools` parsing for `host_tool` entries, SHA-256 verification/fingerprinting, context hash inclusion, and `toolchain.rust.rustc` lookup through the declared tool map. `WORKSPACE.ccl` now declares the current host `rustc` as the first transitional tool.
+Status: implemented `tools` parsing, SHA-256 verification/fingerprinting, context hash inclusion, and `toolchain.rust.rustc` lookup through the declared tool map. `WORKSPACE.ccl` now imports shared CBS workspace prototypes from `//util/cbs:cbs.ccl`; generic host program lookup has been removed, and source tool declarations use explicit `rust_toolchain` / `xcode_tool` types instead of `host_tool`.
 
 ### Phase 3: Tool-aware process execution
 
@@ -159,7 +159,9 @@ Status: implemented `tools` parsing for `host_tool` entries, SHA-256 verificatio
 - Use `env_clear()` and minimal environment for all CBS-owned process execution.
 - Keep a temporary compatibility mode for undeclared host tools, but make it explicit and hash-affecting.
 
-Status: implemented declared tool maps in CBS contexts, plugin planning/resolution contexts, and plugin build requests. CBS actions and plugin SDK calls now have `run_tool`; declared tools execute through action-local synthetic tool directories with cleared environments, private `TMPDIR`/`HOME`, and `PATH` limited to declared tools. `WORKSPACE.ccl` now declares the currently needed transitional host tools (`rustc`, `cargo`, `curl`, `tar`, `cc`, and `ar`) with SHA-256 fingerprints, and Rust/Cargo planning plus native recipes use the declared tool path. Compatibility fallback still exists for undeclared process execution until strict-by-default migration is complete.
+Status: implemented declared tool maps in CBS contexts, plugin planning/resolution contexts, and plugin build requests. CBS actions and plugin SDK calls now have `run_tool`; declared tools execute through action-local synthetic tool directories with cleared environments, private `TMPDIR`/`HOME`, and `PATH` limited to declared tools. Rust/Cargo planning plus native recipes use declared tool paths, and plugin bare-command resolution now rejects undeclared host tools rather than searching `/usr/bin`, `/bin`, or `/usr/local/bin`.
+
+macOS compromise: `WORKSPACE.ccl` declares `platform_requirements.macos.xcode = xcode_tool { tool = "clang"; sdk = "macos" }` and platform-scoped `cc`/`ar` Xcode tools. CBS applies that requirement only on macOS, resolves Xcode through `xcrun`, detects the current Xcode developer directory and macOS SDK if paths are not specified, validates Xcode clang and `TargetConditionals.h` at workspace load time, and includes that requirement in the context hash. Missing Xcode/CLT now fails early instead of surfacing as an accidental `cc` failure later. The `target` section has been removed from `WORKSPACE.ccl`; CBS defaults target configuration from the current host platform unless a workspace explicitly overrides it.
 
 ### Phase 4: Rust/Cargo toolchain ownership
 
@@ -168,17 +170,28 @@ Status: implemented declared tool maps in CBS contexts, plugin planning/resoluti
 - Replace host `curl` and `tar` in crate fetching/extraction with Rust library implementations where practical.
 - Make native build recipes declare `cc`/`ar` or replace `ar` with a Rust archive writer.
 
+Status: partially implemented. Cargo crate sources are now populated through declared `cargo fetch` into CBS-owned `CARGO_HOME`, so crate fetching no longer uses host `curl` or `tar`. `WORKSPACE.ccl` now declares Rust as `rust_toolchain { version = "1.91.1"; dist = ... }`, with pinned Rust dist URLs/hashes for common macOS/Linux hosts; CBS expands that into declared `rustc` and `cargo` tools, validates the active Rust version, and fingerprints the toolchain metadata. The current provider is still a bootstrap `rustup`/current-rustc sysroot provider; actual archive download/extraction remains future work.
+
 ### Phase 5: Strict-by-default execution
 
 - Flip the default so undeclared tools are errors.
 - Make action environments hygienic by default.
-- Require explicit opt-in for host tool escape hatches.
-- Run `cbs build //...` and `cbs test //...` under strict mode.
+- Remove host tool escape hatches.
+- Run `cbs build //...` and `cbs test //...` with strict default behavior.
 - Fix all remaining ambient dependencies.
+
+Status: implemented. Undeclared/bare host tools and known host tool paths are rejected unconditionally in CBS actions, plugin SDK execution, and both Rust plugin implementations. CBS no longer has a strict-mode flag, compatibility flag, or environment-variable escape hatch. The full repository builds and tests with default strict behavior.
+
+Ordering note: do this before the full Phase 6 plugin split, but avoid cementing Rust-specific tool schemas in CBS core while doing it. Phase 5 should focus on enforcement and escape-hatch semantics for whatever tools are already declared; Rust-specific dynamic tool definition belongs in Phase 6.
 
 ### Phase 6: Rust plugin as cdylib
 
 - Split the Rust plugin out so CBS core does not embed Rust-specific resolver/builder logic.
+- Add plugin parameters in `WORKSPACE.ccl`, e.g. `plugins = [{ name = "rust"; path = "..."; parameters = { rust_version = "1.91.2" } }]`.
+- Add a plugin initialization API that receives parameters plus host platform/cache context and returns tool requirements to CBS.
+- Let the Rust plugin own Rust-specific toolchain logic: mapping Rust version + current platform to dist URLs/hashes, choosing archive layout, and exposing declared `rustc`/`cargo` tools.
+- Keep CBS core responsible for generic mechanics only: parameter transport, tool requirement validation, download/cache/extract primitives, hashing/fingerprinting, and exposing tools to actions.
+- Move the temporary `rust_toolchain` concept out of `//util/cbs:cbs.ccl`; any Rust-specific declaration should either be internal to the Rust plugin or derived from Rust plugin parameters.
 - Keep bootstrap sequencing documented:
   1. build CBS with previous compatible CBS,
   2. build Rust plugin,
@@ -189,16 +202,14 @@ Status: implemented declared tool maps in CBS contexts, plugin planning/resoluti
 ## Open questions
 
 1. What is the bootstrap trust root for downloading toolchains: built-in HTTP client, declared host downloader, or pre-seeded cache?
-2. Should `host_tool` require SHA-256 immediately, or allow a warning-only mode during migration?
-3. Should tools be target labels, external requirements, or a third dependency class?
-4. How should plugin-defined tool schemas be validated from `WORKSPACE.ccl`?
+2. What archive/decompression implementation should CBS use for Rust dist tarballs without reintroducing host `tar`?
+3. Should plugin-provided tools be target labels, external requirements, or a third dependency class?
+4. Should plugin parameters be untyped CCL values passed through to plugins, or should CBS ask each plugin for a schema and validate parameters before initialization?
 5. Do we want remote/cache portability guarantees, or only local reproducibility at first?
 6. Should strict mode reject all absolute paths, or allow declared immutable prefixes?
-7. How should platform-specific tools be selected for macOS vs Linux?
+7. What Linux-native `cc`/`ar` replacement should pair with the macOS Xcode compromise?
 
 ## Immediate next steps
 
-1. Move the transitional `host_tool` Rust entries into a Rust-owned downloaded toolchain.
-2. Replace host `curl`/`tar` with Rust library implementations or Rust-plugin-owned downloaded tools.
-3. Make native recipes declare exact `cc`/`ar` requirements per platform, or replace `ar` with a Rust archive writer.
-4. Expand strict-mode coverage from smoke targets to the full repository after remaining bootstrap/toolchain ownership work.
+1. Make native recipes use exact declared `cc`/`ar` requirements per platform; on macOS this currently means the declared Xcode/SDK prerequisite, while Linux should move toward a downloaded LLVM/Zig-style toolchain.
+2. Start Phase 6 by adding plugin parameters and a plugin initialization/tool-requirement API, then move Rust-specific toolchain declarations out of CBS core.

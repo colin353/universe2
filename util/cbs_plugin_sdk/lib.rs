@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 pub const CBS_PLUGIN_ABI_VERSION: u32 = 1;
 
@@ -230,6 +229,21 @@ impl PluginContext {
     where
         S: AsRef<str>,
     {
+        self.run_tool_with_env(tool, args, std::iter::empty::<(&str, &str)>())
+    }
+
+    pub fn run_tool_with_env<S, E, K, V>(
+        &self,
+        tool: &str,
+        args: &[S],
+        env: E,
+    ) -> std::io::Result<Vec<u8>>
+    where
+        S: AsRef<str>,
+        E: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
         let Some(path) = self.tool_paths.get(tool) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -243,7 +257,7 @@ impl PluginContext {
                 format!("declared tool {tool:?} is not available at {path}"),
             ));
         }
-        self.run_resolved_process(bin, args, true)
+        self.run_resolved_process(bin, args, env, true)
     }
 
     pub fn run_process<P: Into<PathBuf>, S>(&self, bin: P, args: &[S]) -> std::io::Result<Vec<u8>>
@@ -257,23 +271,33 @@ impl PluginContext {
             }
         }
         let bin = resolve_command(bin)?;
-        self.run_resolved_process(bin, args, false)
+        self.run_resolved_process(bin, args, std::iter::empty::<(&str, &str)>(), true)
     }
 
-    fn run_resolved_process<S>(
+    fn run_resolved_process<S, E, K, V>(
         &self,
         bin: PathBuf,
         args: &[S],
+        env: E,
         hermetic: bool,
     ) -> std::io::Result<Vec<u8>>
     where
         S: AsRef<str>,
+        E: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
     {
         let mut command = std::process::Command::new(&bin);
         if hermetic {
             configure_hermetic_env(self, &mut command)?;
         }
         let mut cmd_debug = bin.to_string_lossy().to_string();
+        for (key, value) in env {
+            cmd_debug.push(' ');
+            cmd_debug.push_str(key.as_ref());
+            cmd_debug.push_str("=<env>");
+            command.env(key.as_ref(), value.as_ref());
+        }
         for arg in args {
             cmd_debug.push(' ');
             cmd_debug.push_str(arg.as_ref());
@@ -303,25 +327,6 @@ impl PluginContext {
         Ok(output.stdout)
     }
 
-    pub fn download<S: AsRef<str>>(&self, url: S, dest: &Path) -> std::io::Result<()> {
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let args = [
-            "--fail".to_string(),
-            "--location".to_string(),
-            "--silent".to_string(),
-            "--show-error".to_string(),
-            "--output".to_string(),
-            dest.to_string_lossy().to_string(),
-            url.as_ref().to_string(),
-        ];
-        if self.tool_paths.contains_key("curl") {
-            self.run_tool("curl", &args).map(|_| ())
-        } else {
-            self.run_process("curl", &args).map(|_| ())
-        }
-    }
 }
 
 fn configure_hermetic_env(
@@ -373,26 +378,14 @@ fn resolve_command(bin: PathBuf) -> std::io::Result<PathBuf> {
         diagnose_command(&bin, "plugin action")?;
         return Ok(bin);
     }
-    let Some(name) = bin.to_str() else {
-        return Ok(bin);
-    };
     diagnose_command(&bin, "plugin action")?;
-    const DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin"];
-    diagnose_host_path_search(name, DIRS)?;
-    for dir in DIRS {
-        let candidate = Path::new(dir).join(name);
-        if candidate.exists() {
-            diagnose_command(&candidate, "plugin action")?;
-            return Ok(candidate);
-        }
-    }
-    Ok(bin)
-}
-
-static TOOL_WARNINGS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-
-fn strict_tools_enabled() -> bool {
-    std::env::var_os("CBS_STRICT_TOOLS").is_some_and(|value| value != "0")
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "plugin action uses undeclared bare host tool `{}`; declare the tool in WORKSPACE.ccl and call PluginContext::run_tool",
+            bin.display()
+        ),
+    ))
 }
 
 fn diagnose_command(program: &Path, context: &str) -> std::io::Result<()> {
@@ -421,22 +414,10 @@ fn diagnose_host_path_search(tool: &str, dirs: &[&str]) -> std::io::Result<()> {
 }
 
 fn report_tool_violation(message: String) -> std::io::Result<()> {
-    if strict_tools_enabled() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("strict tools violation: {message}"),
-        ));
-    }
-
-    let warnings = TOOL_WARNINGS.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-    if warnings
-        .lock()
-        .expect("tool warning lock poisoned")
-        .insert(message.clone())
-    {
-        eprintln!("[cbs] warning: non-hermetic tool use: {message}");
-    }
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("non-hermetic tool use rejected: {message}"),
+    ))
 }
 
 fn is_known_host_tool_path(program: &Path) -> bool {
@@ -1910,7 +1891,6 @@ mod fb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
 
     const TRANSITIVE_PRODUCTS: u32 = 0;
     const EDITION: u32 = 3;
@@ -2110,27 +2090,12 @@ mod tests {
     }
 
     #[test]
-    fn strict_tools_rejects_bare_command_resolution() {
-        let _guard = env_lock().lock().expect("env lock poisoned");
-        std::env::set_var("CBS_STRICT_TOOLS", "1");
+    fn default_rejects_bare_command_resolution() {
         let err = resolve_command(PathBuf::from("definitely-not-declared-tool")).unwrap_err();
-        std::env::remove_var("CBS_STRICT_TOOLS");
 
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(err.to_string().contains("strict tools violation"));
-    }
-
-    #[test]
-    fn compatibility_mode_allows_bare_command_resolution() {
-        let _guard = env_lock().lock().expect("env lock poisoned");
-        std::env::remove_var("CBS_STRICT_TOOLS");
-        let resolved = resolve_command(PathBuf::from("definitely-not-declared-tool")).unwrap();
-
-        assert_eq!(resolved, PathBuf::from("definitely-not-declared-tool"));
-    }
-
-    fn env_lock() -> &'static Mutex<()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
+        assert!(err
+            .to_string()
+            .contains("non-hermetic tool use rejected"));
     }
 }

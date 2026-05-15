@@ -24,12 +24,7 @@ fn main() {
 }
 
 fn run() -> std::io::Result<()> {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(args.first().map(|arg| arg.as_str()), Some("--strict-tools")) {
-        std::env::set_var("CBS_STRICT_TOOLS", "1");
-        args.remove(0);
-    }
-    let mut args = args.into_iter();
+    let mut args = std::env::args().skip(1);
     let Some(command) = args.next() else {
         return Err(usage_error());
     };
@@ -268,7 +263,7 @@ fn run_tests(targets: Vec<String>, executables: Vec<std::path::PathBuf>) -> std:
     let mut failed = Vec::new();
     for (target, executable) in targets.iter().zip(executables.iter()) {
         eprintln!("[cbs] test {target}");
-        let output = match std::process::Command::new(executable).output() {
+        let output = match hygienic_test_command(target, executable)?.output() {
             Ok(output) => output,
             Err(e) => {
                 eprintln!("[cbs] test FAIL {target}");
@@ -298,6 +293,43 @@ fn run_tests(targets: Vec<String>, executables: Vec<std::path::PathBuf>) -> std:
     }
 }
 
+fn hygienic_test_command(
+    target: &str,
+    executable: &std::path::Path,
+) -> std::io::Result<std::process::Command> {
+    let workdir = executable
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(".cbs-test-env")
+        .join(label_dir(target));
+    let tmpdir = workdir.join("tmp");
+    let home = workdir.join("home");
+    std::fs::create_dir_all(&tmpdir)?;
+    std::fs::create_dir_all(&home)?;
+    let mut command = std::process::Command::new(executable);
+    command
+        .env_clear()
+        .env("PATH", "")
+        .env("TMPDIR", tmpdir)
+        .env("HOME", home);
+    Ok(command)
+}
+
+fn label_dir(label: &str) -> String {
+    label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
 fn print_test_failure_logs(target: &str, output: &std::process::Output) {
     eprintln!("--- {target} status ---");
     eprintln!("{}", output.status);
@@ -324,6 +356,6 @@ fn print_test_failure_logs(target: &str, output: &std::process::Output) {
 fn usage_error() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
-        "usage: cbs [--strict-tools] build <target-or-pattern>...\n       cbs [--strict-tools] test <target-or-pattern>...\n       cbs [--strict-tools] install //package:target | :target\n       cbs [--strict-tools] run //package:target | :target [-- args...]",
+        "usage: cbs build <target-or-pattern>...\n       cbs test <target-or-pattern>...\n       cbs install //package:target | :target\n       cbs run //package:target | :target [-- args...]",
     )
 }

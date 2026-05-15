@@ -1,0 +1,8 @@
+rust_toolchain = {
+    _type = "rust_toolchain"
+    provider = "rustup"
+}
+
+xcode_tool = {
+    _type = "xcode_tool"
+}

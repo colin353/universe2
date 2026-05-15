@@ -1,12 +1,4 @@
-use std::collections::HashSet;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
-
-static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-
-pub fn strict_tools_enabled() -> bool {
-    std::env::var_os("CBS_STRICT_TOOLS").is_some_and(|value| value != "0")
-}
 
 pub fn diagnose_command(program: &Path, context: &str) -> std::io::Result<()> {
     if program.components().count() == 1 {
@@ -34,18 +26,10 @@ pub fn diagnose_host_path_search(tool: &str, dirs: &[&str]) -> std::io::Result<(
 }
 
 fn report(message: String) -> std::io::Result<()> {
-    if strict_tools_enabled() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("strict tools violation: {message}"),
-        ));
-    }
-
-    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
-    if warned.lock().expect("tool warning lock poisoned").insert(message.clone()) {
-        eprintln!("[cbs] warning: non-hermetic tool use: {message}");
-    }
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("non-hermetic tool use rejected: {message}"),
+    ))
 }
 
 fn is_known_host_tool_path(program: &Path) -> bool {

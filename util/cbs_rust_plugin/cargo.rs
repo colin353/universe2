@@ -346,8 +346,7 @@ impl CargoDependencyPlanner {
             args.push(target);
         }
 
-        let output = context
-            .run_tool("cargo", &args)
+        let output = run_cargo(&context, &args)
             .map_err(|e| std::io::Error::new(e.kind(), format!("cargo metadata failed: {e}")))?;
         let plan = metadata_to_dependency_plan(&context, requirements, &output)?;
         write_cached_dependency_plan(&plan_cache, &plan)?;
@@ -382,6 +381,97 @@ fn write_cached_dependency_plan(
         .to_string(),
     )?;
     std::fs::rename(tmp, path)
+}
+
+fn run_cargo(context: &PluginContext, args: &[String]) -> std::io::Result<Vec<u8>> {
+    let cargo_home = context.cache_dir.join("cargo-home");
+    std::fs::create_dir_all(&cargo_home)?;
+    context.run_tool_with_env(
+        "cargo",
+        args,
+        [("CARGO_HOME", cargo_home.to_string_lossy().to_string())],
+    )
+}
+
+fn ensure_cargo_source(
+    context: &PluginContext,
+    crate_name: &str,
+    crate_version: &str,
+    features: &[&str],
+) -> std::io::Result<std::path::PathBuf> {
+    if let Some(source) = find_cargo_source(context, crate_name, crate_version)? {
+        return Ok(source);
+    }
+
+    let workdir = context
+        .working_directory()
+        .join("cargo-fetch")
+        .join(cargo_target_name(crate_name, crate_version, &HashMap::new()));
+    std::fs::create_dir_all(workdir.join("src"))?;
+    let manifest_path = workdir.join("Cargo.toml");
+    std::fs::write(&manifest_path, fetch_manifest(crate_name, crate_version, features))?;
+    std::fs::write(workdir.join("src").join("lib.rs"), "")?;
+    run_cargo(
+        context,
+        &[
+            "fetch".to_string(),
+            "--manifest-path".to_string(),
+            manifest_path.to_string_lossy().to_string(),
+        ],
+    )
+    .map_err(|e| std::io::Error::new(e.kind(), format!("cargo fetch failed: {e}")))?;
+
+    find_cargo_source(context, crate_name, crate_version)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{crate_name} {crate_version} was not found in Cargo's registry source cache after cargo fetch"),
+        )
+    })
+}
+
+fn fetch_manifest(crate_name: &str, crate_version: &str, features: &[&str]) -> String {
+    let alias = crate_name.replace('-', "_");
+    let features = features
+        .iter()
+        .filter(|feature| !feature.is_empty() && **feature != "default")
+        .map(|feature| format!("\"{}\"", toml_escape(feature)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"[package]
+name = "cbs-cargo-fetch"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+{alias} = {{ package = "{}", version = "={}", default-features = false, features = [{features}] }}
+"#,
+        toml_escape(crate_name),
+        toml_escape(crate_version),
+    )
+}
+
+fn find_cargo_source(
+    context: &PluginContext,
+    crate_name: &str,
+    crate_version: &str,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let source_root = context.cache_dir.join("cargo-home").join("registry").join("src");
+    if !source_root.exists() {
+        return Ok(None);
+    }
+    let source_dir = format!("{crate_name}-{crate_version}");
+    for registry in std::fs::read_dir(source_root)? {
+        let registry = registry?;
+        if !registry.file_type()?.is_dir() {
+            continue;
+        }
+        let candidate = registry.path().join(&source_dir);
+        if candidate.join("Cargo.toml").is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 fn json_string_map(value: Option<&serde_json::Value>) -> std::io::Result<HashMap<String, String>> {
@@ -1465,38 +1555,7 @@ impl CargoResolver {
 
         let workdir = context.working_directory();
         std::fs::create_dir_all(&workdir).ok();
-
-        // Download the crate tarball
-        let tar_dest = workdir.join("crate.tar");
-
-        if !tar_dest.exists() || tar_dest.metadata().map(|m| m.len() == 0).unwrap_or(true) {
-            context.download(
-                format!(
-                    "https://crates.io/api/v1/crates/{}/{}/download",
-                    crate_name, crate_version
-                ),
-                &tar_dest,
-            )?;
-        }
-
-        // Untar the crate tarball
-        let dest = workdir.join("crate");
-        if !dest.join("Cargo.toml").exists() {
-            if dest.exists() {
-                std::fs::remove_dir_all(&dest)?;
-            }
-            std::fs::create_dir_all(&dest)?;
-            context.run_tool(
-                "tar",
-                &[
-                    "xzvf",
-                    &tar_dest.to_string_lossy(),
-                    "-C",
-                    &dest.to_string_lossy(),
-                    "--strip-components=1",
-                ],
-            )?;
-        }
+        let dest = ensure_cargo_source(&context, crate_name, crate_version, &features)?;
 
         let mut rust_files = Vec::new();
         get_rust_files(&dest.join("src"), &mut rust_files)?;

@@ -713,6 +713,7 @@ fn target_tables<'a>(
 fn load_workspace_config(root: &Path, workspace_file: &Path) -> std::io::Result<WorkspaceConfig> {
     let table = load_workspace_table(root, workspace_file)?;
     let tools = workspace_tools(root, &table)?;
+    let platform_fingerprints = platform_requirement_fingerprints(root, &table)?;
     let rustc_ref = table
         .get("toolchain")
         .and_then(|value| value.as_table())
@@ -735,7 +736,7 @@ fn load_workspace_config(root: &Path, workspace_file: &Path) -> std::io::Result<
     Ok(WorkspaceConfig {
         cache_dir,
         rustc,
-        tool_fingerprints: tool_fingerprints(&tools),
+        tool_fingerprints: tool_fingerprints(&tools, platform_fingerprints),
         tools,
         target_config: target_config(&table),
         plugins: workspace_plugins(root, &table)?,
@@ -752,44 +753,100 @@ fn workspace_tools(
     let tools = value.as_table().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "tools must be a table")
     })?;
-    tools
-        .iter()
-        .map(|(name, value)| {
-            let tool = value.as_table().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("tools.{name} must be a table"),
-                )
-            })?;
-            let kind = tool
-                .get("_type")
-                .or_else(|| tool.get("type"))
-                .and_then(|value| value.as_str())
-                .unwrap_or("host_tool");
-            if kind != "host_tool" {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("tools.{name} has unsupported type {kind:?}; only host_tool is currently supported"),
-                ));
+    let mut resolved = HashMap::new();
+    for (name, value) in tools {
+        let tool = value.as_table().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("tools.{name} must be a table"),
+            )
+        })?;
+        if name == current_os() && !is_tool_declaration(tool) {
+            for (nested_name, nested_value) in tool {
+                let nested_tool = nested_value.as_table().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("tools.{name}.{nested_name} must be a table"),
+                    )
+                })?;
+                add_workspace_tool(root, nested_name, nested_tool, &mut resolved)?;
             }
-            let path = root_relative_tool_path(root, &required_string(tool, "path")?);
+        } else {
+            add_workspace_tool(root, name, tool, &mut resolved)?;
+        }
+    }
+    Ok(resolved)
+}
+
+fn is_tool_declaration(tool: &ConfigTable) -> bool {
+    ["_type", "type", "path", "program", "xcode_tool", "tool", "root", "provider"]
+        .iter()
+        .any(|key| tool.contains_key(*key))
+}
+
+fn add_workspace_tool(
+    root: &Path,
+    name: &str,
+    tool: &ConfigTable,
+    resolved: &mut HashMap<String, WorkspaceToolConfig>,
+) -> std::io::Result<()> {
+    let kind = tool
+        .get("_type")
+        .or_else(|| tool.get("type"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("tools.{name} must specify _type"),
+            )
+        })?;
+    match kind {
+        "rust_toolchain" => {
+            let toolchain = rust_toolchain_tools(root, name, tool)?;
+            for tool in toolchain {
+                insert_workspace_tool(resolved, tool)?;
+            }
+        }
+        "xcode_tool" => {
+            let path = declared_tool_path(root, name, tool)?;
             let sha256 = tool
                 .get("sha256")
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
-            let fingerprint = host_tool_fingerprint(name, kind, &path, sha256.as_deref())?;
-            Ok((
-                name.clone(),
+            let fingerprint = declared_tool_fingerprint(name, kind, &path, sha256.as_deref())?;
+            insert_workspace_tool(
+                resolved,
                 WorkspaceToolConfig {
-                    name: name.clone(),
+                    name: name.to_string(),
                     kind: kind.to_string(),
                     path,
                     sha256,
                     fingerprint,
                 },
+            )?;
+        }
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("tools.{name} has unsupported type {kind:?}"),
             ))
-        })
-        .collect()
+        }
+    }
+    Ok(())
+}
+
+fn insert_workspace_tool(
+    resolved: &mut HashMap<String, WorkspaceToolConfig>,
+    tool: WorkspaceToolConfig,
+) -> std::io::Result<()> {
+    if resolved.contains_key(&tool.name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("tool {:?} is declared more than once", tool.name),
+        ));
+    }
+    resolved.insert(tool.name.clone(), tool);
+    Ok(())
 }
 
 fn resolve_tool_or_path(
@@ -803,11 +860,462 @@ fn resolve_tool_or_path(
         .unwrap_or_else(|| root_relative(root, value))
 }
 
-fn tool_fingerprints(tools: &HashMap<String, WorkspaceToolConfig>) -> Vec<(String, String)> {
+fn declared_tool_path(root: &Path, name: &str, tool: &ConfigTable) -> std::io::Result<PathBuf> {
+    if let Some(path) = tool.get("path").and_then(|value| value.as_str()) {
+        return Ok(root_relative_tool_path(root, path));
+    }
+    if let Some(xcode_tool) = tool
+        .get("xcode_tool")
+        .or_else(|| tool.get("tool"))
+        .and_then(|value| value.as_str())
+    {
+        if current_os() == "macos" {
+            return xcrun_find(xcode_tool).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to resolve Xcode tool {xcode_tool:?} for tools.{name}; install Xcode or Command Line Tools: {e}"
+                    ),
+                )
+            });
+        }
+    }
+    if let Some(program) = tool.get("program").and_then(|value| value.as_str()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("tools.{name} uses program = {program:?}, but generic host program search is no longer supported; use an explicit toolchain type or path"),
+        ));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("tools.{name} must specify path or a platform-specific tool field"),
+    ))
+}
+
+fn rust_toolchain_tools(
+    root: &Path,
+    name: &str,
+    toolchain: &ConfigTable,
+) -> std::io::Result<Vec<WorkspaceToolConfig>> {
+    let root = rust_toolchain_root(root, name, toolchain)?;
+    let rustc = root.join("bin").join(executable_name("rustc"));
+    let cargo = root.join("bin").join(executable_name("cargo"));
+    if !rustc.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "rust toolchain {name:?} does not contain rustc at {}",
+                rustc.display()
+            ),
+        ));
+    }
+    if !cargo.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "rust toolchain {name:?} does not contain cargo at {}",
+                cargo.display()
+            ),
+        ));
+    }
+    validate_rust_toolchain(name, toolchain, &rustc)?;
+
+    let metadata = rust_toolchain_metadata(name, toolchain)?;
+    Ok(vec![
+        rust_toolchain_tool("rustc", &rustc, &metadata)?,
+        rust_toolchain_tool("cargo", &cargo, &metadata)?,
+    ])
+}
+
+fn rust_toolchain_root(
+    root: &Path,
+    name: &str,
+    toolchain: &ConfigTable,
+) -> std::io::Result<PathBuf> {
+    if let Some(path) = toolchain.get("root").and_then(|value| value.as_str()) {
+        return Ok(root_relative_tool_path(root, path));
+    }
+    if let Some(env) = toolchain.get("root_env").and_then(|value| value.as_str()) {
+        if let Some(path) = std::env::var_os(env) {
+            return Ok(PathBuf::from(path));
+        }
+    }
+    match toolchain
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .unwrap_or("rustup")
+    {
+        "rustup" => rustup_sysroot().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to resolve rust_toolchain {name:?} from rustup/current rustc: {e}"),
+            )
+        }),
+        provider => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("rust_toolchain {name:?} has unsupported provider {provider:?}"),
+        )),
+    }
+}
+
+fn rustup_sysroot() -> std::io::Result<PathBuf> {
+    let output = std::process::Command::new("rustc")
+        .arg("--print")
+        .arg("sysroot")
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "rustc --print sysroot failed",
+        ));
+    }
+    let sysroot = String::from_utf8(output.stdout)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(PathBuf::from(sysroot.trim()))
+}
+
+fn rust_toolchain_tool(
+    name: &str,
+    path: &Path,
+    metadata: &str,
+) -> std::io::Result<WorkspaceToolConfig> {
+    let fingerprint = declared_tool_fingerprint(name, "rust_toolchain", path, None)?;
+    Ok(WorkspaceToolConfig {
+        name: name.to_string(),
+        kind: "rust_toolchain".to_string(),
+        path: path.to_path_buf(),
+        sha256: None,
+        fingerprint: format!("{fingerprint};{metadata}"),
+    })
+}
+
+fn rust_toolchain_metadata(name: &str, toolchain: &ConfigTable) -> std::io::Result<String> {
+    let version = toolchain
+        .get("version")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unspecified");
+    let host = toolchain
+        .get("host")
+        .and_then(|value| value.as_str())
+        .map(|host| host.to_string())
+        .unwrap_or_else(current_rust_host_triple);
+    let dist_hash = if let Some(dist) = toolchain.get("dist").and_then(|value| value.as_table()) {
+        let key = dist_key(&host);
+        let dist = dist.get(&key).and_then(|value| value.as_table()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("rust_toolchain {name:?} has no dist entry for host {host:?} (expected key {key})"),
+            )
+        })?;
+        dist.get("sha256")
+            .or_else(|| dist.get("hash"))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("rust_toolchain {name:?} dist entry for {host:?} must include sha256"),
+                )
+            })?
+            .to_string()
+    } else {
+        "unspecified".to_string()
+    };
+    Ok(format!(
+        "rust-toolchain:version={version}:host={host}:dist-sha256={dist_hash}"
+    ))
+}
+
+fn current_rust_host_triple() -> String {
+    let arch = std::env::consts::ARCH;
+    match std::env::consts::OS {
+        "macos" => format!("{arch}-apple-darwin"),
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        "windows" => format!("{arch}-pc-windows-msvc"),
+        os => format!("{arch}-unknown-{os}"),
+    }
+}
+
+fn dist_key(host: &str) -> String {
+    host.chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}
+
+fn validate_rust_toolchain(
+    name: &str,
+    toolchain: &ConfigTable,
+    rustc: &Path,
+) -> std::io::Result<()> {
+    let output = std::process::Command::new(rustc).arg("-Vv").output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("rust_toolchain {name:?} failed to run {} -Vv", rustc.display()),
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if let Some(expected) = toolchain.get("version").and_then(|value| value.as_str()) {
+        let release = rustc_version_field(&stdout, "release").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("rust_toolchain {name:?} rustc -Vv output did not include a release"),
+            )
+        })?;
+        if release != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("rust_toolchain {name:?} expected Rust {expected}, found {release}"),
+            ));
+        }
+    }
+    if let Some(expected) = toolchain.get("host").and_then(|value| value.as_str()) {
+        let host = rustc_version_field(&stdout, "host").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("rust_toolchain {name:?} rustc -Vv output did not include a host"),
+            )
+        })?;
+        if host != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("rust_toolchain {name:?} expected host {expected}, found {host}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn rustc_version_field<'a>(output: &'a str, field: &str) -> Option<&'a str> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(field)?.strip_prefix(": "))
+}
+
+fn executable_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
+}
+
+fn platform_requirement_fingerprints(
+    root: &Path,
+    table: &ConfigTable,
+) -> std::io::Result<Vec<(String, String)>> {
+    let Some(value) = table.get("platform_requirements") else {
+        return Ok(Vec::new());
+    };
+    let requirements = value.as_table().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "platform_requirements must be a table",
+        )
+    })?;
+    let mut active = Vec::new();
+    for (name, value) in requirements {
+        let requirement = value.as_table().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("platform_requirements.{name} must be a table"),
+            )
+        })?;
+        if name == current_os() {
+            for (nested_name, nested_value) in requirement {
+                let nested_requirement = nested_value.as_table().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("platform_requirements.{name}.{nested_name} must be a table"),
+                    )
+                })?;
+                active.push((
+                    Some(name.as_str()),
+                    nested_name.as_str(),
+                    nested_requirement,
+                ));
+            }
+        } else if is_platform_requirement(requirement) {
+            active.push((None, name.as_str(), requirement));
+        }
+    }
+
+    active
+        .into_iter()
+        .map(|(platform_scope, name, requirement)| {
+            platform_requirement_fingerprint(root, platform_scope, name, requirement)
+        })
+        .filter_map(|result| result.transpose())
+        .collect()
+}
+
+fn is_platform_requirement(requirement: &ConfigTable) -> bool {
+    [
+        "_type",
+        "type",
+        "platform",
+        "path",
+        "program",
+        "xcode_tool",
+        "tool",
+    ]
+        .iter()
+        .any(|key| requirement.contains_key(*key))
+}
+
+fn platform_requirement_fingerprint(
+    root: &Path,
+    platform_scope: Option<&str>,
+    name: &str,
+    requirement: &ConfigTable,
+) -> std::io::Result<Option<(String, String)>> {
+    if platform_scope.is_some_and(|platform| platform != current_os()) {
+        return Ok(None);
+    }
+
+    let kind = requirement
+        .get("_type")
+        .or_else(|| requirement.get("type"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("platform requirement {name} must specify _type"),
+            )
+        })?;
+    let platform = requirement
+        .get("platform")
+        .and_then(|value| value.as_str())
+        .unwrap_or(match kind {
+            "xcode_tool" => "macos",
+            _ => "",
+        });
+    if !platform.is_empty() && platform != current_os() {
+        return Ok(None);
+    }
+
+    let fingerprint = match kind {
+        "xcode_tool" => {
+            let path = declared_tool_path(root, name, requirement)?;
+            let sha256 = requirement.get("sha256").and_then(|value| value.as_str());
+            let mut fingerprint = declared_tool_fingerprint(name, kind, &path, sha256)?;
+            if requires_macos_sdk(requirement) {
+                let xcode_fingerprint = macos_xcode_fingerprint(
+                    name,
+                    &optional_requirement_path(root, requirement, "developer_dir")?
+                        .unwrap_or_else(detect_xcode_developer_dir),
+                    &optional_requirement_path(root, requirement, "sdk_path")?
+                        .unwrap_or_else(detect_macos_sdk_path),
+                )?;
+                fingerprint.push(';');
+                fingerprint.push_str(&xcode_fingerprint);
+            }
+            fingerprint
+        }
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "platform requirement {name} has unsupported type {kind:?}; expected xcode_tool"
+                ),
+            ))
+        }
+    };
+
+    let key = platform_scope
+        .map(|platform| format!("platform_requirement:{platform}:{name}"))
+        .unwrap_or_else(|| format!("platform_requirement:{name}"));
+    Ok(Some((key, fingerprint)))
+}
+
+fn requires_macos_sdk(requirement: &ConfigTable) -> bool {
+    current_os() == "macos"
+        && (requirement.get("xcode_tool").is_some()
+            || requirement
+                .get("sdk")
+                .and_then(|value| value.as_str())
+                .is_some_and(|sdk| sdk == "macos"))
+}
+
+fn optional_requirement_path(
+    root: &Path,
+    requirement: &ConfigTable,
+    key: &str,
+) -> std::io::Result<Option<PathBuf>> {
+    requirement
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(|value| Ok(root_relative_path(root, value)))
+        .transpose()
+}
+
+fn macos_xcode_fingerprint(
+    name: &str,
+    developer_dir: &Path,
+    sdk_path: &Path,
+) -> std::io::Result<String> {
+    if !developer_dir.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "macOS Xcode requirement {name} is missing developer_dir {}. Install Xcode or Command Line Tools and update WORKSPACE.ccl.",
+                developer_dir.display()
+            ),
+        ));
+    }
+    if !sdk_path.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "macOS Xcode requirement {name} is missing sdk_path {}. Install the macOS SDK and update WORKSPACE.ccl.",
+                sdk_path.display()
+            ),
+        ));
+    }
+
+    let clang = developer_dir
+        .join("Toolchains")
+        .join("XcodeDefault.xctoolchain")
+        .join("usr")
+        .join("bin")
+        .join("clang");
+    if !clang.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "macOS Xcode requirement {name} is missing clang at {}",
+                clang.display()
+            ),
+        ));
+    }
+    let target_conditionals = sdk_path.join("usr").join("include").join("TargetConditionals.h");
+    if !target_conditionals.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "macOS Xcode requirement {name} is missing SDK header {}",
+                target_conditionals.display()
+            ),
+        ));
+    }
+
+    let target_conditionals_sha = file_sha256(&target_conditionals)?;
+    Ok(format!(
+        "macos_xcode:developer_dir={}:sdk_path={}:TargetConditionals.h={target_conditionals_sha}",
+        developer_dir.to_string_lossy(),
+        sdk_path.to_string_lossy()
+    ))
+}
+
+fn tool_fingerprints(
+    tools: &HashMap<String, WorkspaceToolConfig>,
+    platform_fingerprints: Vec<(String, String)>,
+) -> Vec<(String, String)> {
     let mut fingerprints: Vec<_> = tools
         .iter()
         .map(|(name, tool)| (name.clone(), tool.fingerprint.clone()))
         .collect();
+    fingerprints.extend(platform_fingerprints);
     fingerprints.sort_by(|a, b| a.0.cmp(&b.0));
     fingerprints
 }
@@ -827,7 +1335,7 @@ fn context_tools(tools: &HashMap<String, WorkspaceToolConfig>) -> HashMap<String
         .collect()
 }
 
-fn host_tool_fingerprint(
+fn declared_tool_fingerprint(
     name: &str,
     kind: &str,
     path: &Path,
@@ -912,12 +1420,51 @@ fn workspace_plugins(
         .collect()
 }
 
+fn detect_xcode_developer_dir() -> PathBuf {
+    command_output_path("/usr/bin/xcode-select", &["-p"]).unwrap_or_else(|| {
+        PathBuf::from("/Applications/Xcode.app").join("Contents").join("Developer")
+    })
+}
+
+fn detect_macos_sdk_path() -> PathBuf {
+    command_output_path("/usr/bin/xcrun", &["--show-sdk-path"]).unwrap_or_else(|| {
+        PathBuf::from("/Library")
+            .join("Developer")
+            .join("CommandLineTools")
+            .join("SDKs")
+            .join("MacOSX.sdk")
+    })
+}
+
+fn xcrun_find(tool: &str) -> std::io::Result<PathBuf> {
+    command_output_path("/usr/bin/xcrun", &["--find", tool]).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("xcrun could not find {tool}"),
+        )
+    })
+}
+
+fn command_output_path(program: &str, args: &[&str]) -> Option<PathBuf> {
+    let output = std::process::Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let path = stdout.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+fn current_os() -> &'static str {
+    std::env::consts::OS
+}
+
 fn target_config(table: &ConfigTable) -> Vec<(BuildConfigKey, String)> {
     let target = table.get("target").and_then(|value| value.as_table());
     let os = target
         .and_then(|target| target.get("os"))
         .and_then(|value| value.as_str())
-        .unwrap_or(std::env::consts::OS);
+        .unwrap_or(current_os());
     let family = target
         .and_then(|target| target.get("family"))
         .and_then(|value| value.as_str())

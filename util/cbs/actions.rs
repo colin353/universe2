@@ -39,7 +39,7 @@ impl BuildActions {
             }
         }
         crate::tool_diagnostics::diagnose_command(&bin, "CBS action")?;
-        self.run_resolved_process(context, bin, args, env, false)
+        self.run_resolved_process(context, bin, args, env, true)
     }
 
     pub fn run_tool<S>(&self, context: &Context, tool: &str, args: &[S]) -> std::io::Result<Vec<u8>>
@@ -133,35 +133,6 @@ impl BuildActions {
         Ok(out.stdout)
     }
 
-    pub fn download<S: Into<String>, P: Into<std::path::PathBuf>>(
-        &self,
-        context: &Context,
-        url: S,
-        dest: P,
-    ) -> std::io::Result<()> {
-        let dest = dest.into();
-        if let Some(p) = dest.parent() {
-            std::fs::create_dir_all(p).ok();
-        }
-        let url = url.into();
-        context.log(format!("download URL: {url}"));
-
-        let args = [
-            "--fail".to_string(),
-            "--location".to_string(),
-            "--silent".to_string(),
-            "--show-error".to_string(),
-            "--output".to_string(),
-            dest.to_string_lossy().to_string(),
-            url,
-        ];
-
-        if context.tools.contains_key("curl") {
-            self.run_tool(context, "curl", &args).map(|_| ())
-        } else {
-            self.run_process(context, curl_command()?, &args).map(|_| ())
-        }
-    }
 }
 
 fn configure_hermetic_env(
@@ -205,17 +176,6 @@ fn symlink_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn symlink_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::copy(src, dst).map(|_| ())
-}
-
-fn curl_command() -> std::io::Result<&'static str> {
-    const DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin"];
-    crate::tool_diagnostics::diagnose_host_path_search("curl", DIRS)?;
-    for candidate in ["/usr/bin/curl", "/bin/curl", "/usr/local/bin/curl"] {
-        if Path::new(candidate).exists() {
-            return Ok(candidate);
-        }
-    }
-    Ok("curl")
 }
 
 fn command_name(command: &str) -> &str {
